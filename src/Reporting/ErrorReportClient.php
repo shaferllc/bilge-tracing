@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Bilge\Tracing\Reporting;
 
-use Illuminate\Contracts\Foundation\Application;
 use Bilge\Tracing\BreadcrumbBuffer;
 use Bilge\Tracing\ErrorIngestClient;
 use Bilge\Tracing\Id;
@@ -12,6 +11,7 @@ use Bilge\Tracing\Support\DataRedactor;
 use Bilge\Tracing\Support\ErrorSuppressionKey;
 use Bilge\Tracing\ThrowableSupport;
 use Bilge\Tracing\Tracer;
+use Illuminate\Contracts\Foundation\Application;
 use Throwable;
 
 /**
@@ -161,7 +161,11 @@ final class ErrorReportClient
         $app = null;
         if (function_exists('app')) {
             try {
-                $app = app();
+                // Outside Laravel, app() can return a bare Illuminate\Container\Container (e.g. a Symfony
+                // or plain-PHP app that pulls in illuminate/container); only a full Application has the
+                // environment/request context the middleware reads.
+                $resolved = app();
+                $app = $resolved instanceof Application ? $resolved : null;
             } catch (Throwable) {
                 $app = null;
             }

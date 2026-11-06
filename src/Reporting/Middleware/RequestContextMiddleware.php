@@ -4,9 +4,9 @@ declare(strict_types=1);
 
 namespace Bilge\Tracing\Reporting\Middleware;
 
+use Bilge\Tracing\Reporting\ReportMiddlewareInterface;
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Http\Request;
-use Bilge\Tracing\Reporting\ReportMiddlewareInterface;
 use Throwable;
 
 /**
@@ -28,7 +28,7 @@ final class RequestContextMiddleware implements ReportMiddlewareInterface
                 return $payload;
             }
         }
-        if ($app === null || $app->runningInConsole()) {
+        if (! $app instanceof Application || $app->runningInConsole()) {
             return $payload;
         }
 

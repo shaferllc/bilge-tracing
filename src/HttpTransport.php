@@ -50,7 +50,7 @@ final class HttpTransport
             ],
         ]);
 
-        $result = @file_get_contents($url, false, $ctx);
+        [$result, $responseHeaders] = self::fetch($url, $ctx);
         if ($result === false) {
             return false;
         }
@@ -58,11 +58,11 @@ final class HttpTransport
         $decoded = json_decode($result, true);
         self::rememberConfigVersion(is_array($decoded) ? $decoded : null);
 
-        if (! isset($http_response_header) || ! is_array($http_response_header)) {
+        if ($responseHeaders === []) {
             return true;
         }
 
-        $statusLine = $http_response_header[0] ?? '';
+        $statusLine = $responseHeaders[0] ?? '';
         if (preg_match('#HTTP/\S+\s+(\d{3})#', $statusLine, $m)) {
             $code = (int) $m[1];
 
@@ -91,10 +91,10 @@ final class HttpTransport
             ],
         ]);
 
-        $result = @file_get_contents($url, false, $ctx);
+        [$result, $responseHeaders] = self::fetch($url, $ctx);
         $status = null;
-        if (isset($http_response_header) && is_array($http_response_header)) {
-            $statusLine = $http_response_header[0] ?? '';
+        if ($responseHeaders !== []) {
+            $statusLine = $responseHeaders[0] ?? '';
             if (preg_match('#HTTP/\S+\s+(\d{3})#', $statusLine, $m)) {
                 $status = (int) $m[1];
             }
@@ -203,5 +203,30 @@ final class HttpTransport
         }
 
         return false;
+    }
+
+    /**
+     * GET/POST through the http stream wrapper, returning the body and the raw response header lines.
+     * Reads headers from stream metadata instead of $http_response_header (deprecated in PHP 8.5).
+     *
+     * @param  resource  $ctx
+     * @return array{0: string|false, 1: list<string>}
+     */
+    private static function fetch(string $url, $ctx): array
+    {
+        $stream = @fopen($url, 'r', false, $ctx);
+        if ($stream === false) {
+            return [false, []];
+        }
+
+        $meta = stream_get_meta_data($stream);
+        $body = stream_get_contents($stream);
+        fclose($stream);
+
+        $headers = isset($meta['wrapper_data']) && is_array($meta['wrapper_data'])
+            ? array_values(array_filter($meta['wrapper_data'], 'is_string'))
+            : [];
+
+        return [$body, $headers];
     }
 }

@@ -4,13 +4,13 @@ declare(strict_types=1);
 
 namespace Bilge\Tracing\Reporting\Middleware;
 
-use Illuminate\Contracts\Foundation\Application;
-use Illuminate\Http\Request;
-use Illuminate\Log\Context\Repository as LogContextRepository;
 use Bilge\Tracing\Laravel\ActiveContext;
 use Bilge\Tracing\Reporting\ReportMiddlewareInterface;
 use Bilge\Tracing\Support\DataRedactor;
 use Bilge\Tracing\Support\ServerRuntimeSnapshot;
+use Illuminate\Contracts\Foundation\Application;
+use Illuminate\Http\Request;
+use Illuminate\Log\Context\Repository as LogContextRepository;
 use Throwable;
 
 /**
@@ -32,6 +32,10 @@ final class ApplicationContextMiddleware implements ReportMiddlewareInterface
             try {
                 $app = app();
             } catch (Throwable) {
+                return $payload;
+            }
+            // A bare Illuminate container (non-Laravel host) has no version/environment to report.
+            if (! $app instanceof Application) {
                 return $payload;
             }
         }
