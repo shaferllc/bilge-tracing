@@ -1,0 +1,437 @@
+# bilge/tracing
+
+PHP library for **Bilge** distributed tracing: compact **traceparent**-style propagation, **W3C baggage**, manual transactions/spans, and optional Laravel integration. Wire formats stay compatible with common PHP tracing clients without naming third-party vendors here.
+
+**Free dashboard:** [Create a free Starter account](https://bilge.sh/register) (no credit card) — one project, thousands of events/month. Copy your project API key from Settings and view grouped errors in the web UI.
+
+## Install
+
+Requirements: **PHP 8.3+** and **Composer**. You always add the library with Composer; only Laravel gets auto-wiring via a service provider.
+
+### Laravel application
+
+Run these from your **Laravel project root** (the directory that contains `artisan` and `composer.json`):
+
+1. **Add the package**
+   ```bash
+   cd /path/to/your-laravel-app
+   composer require bilge/tracing
+   ```
+   Composer updates `composer.json` / `composer.lock` and downloads `bilge/tracing` into `vendor/`.
+
+2. **Configure Bilge (pick one path)**
+   - **Interactive (recommended):** `php artisan bilge:install` — choose **Create a new project** (Bilge web URL + your **API token** from Profile → **API tokens**) or **Use an existing DSN**. Create flow calls Bilge’s API (`GET /api/v1/me`, `POST /api/v1/projects`), then writes **`BILGE_DSN`** using the new project’s ingest key. It also appends `BILGE_LARAVEL=true` to `.env`.
+   - **Manual:** add to `.env` yourself (see [Quick install](#quick-install) under **Laravel** below), or set `BILGE_API_KEY` + `BILGE_URL` if your team shares one Bilge host.
+
+3. **Clear config cache** (if you use it in this environment)
+   ```bash
+   php artisan config:clear
+   ```
+
+4. **Optional — publish config** when you need every env knob (sampling, middleware, log/metrics toggles):
+   ```bash
+   php artisan vendor:publish --tag=bilge-tracing-config
+   ```
+
+5. **Tracing middleware** — for distributed traces, register `bilgeTracing.continueTrace` (and optionally `bilgeTracing.performance`) on your `web` / `api` stacks, or use `BILGE_PERFORMANCE_AUTO_MIDDLEWARE=true` for the performance middleware only (see [Performance monitoring](#performance-monitoring-traces--spans)).
+
+Laravel **auto-discovers** `Bilge\Tracing\Laravel\BilgeTracingServiceProvider`; you do not add it to `config/app.php` manually.
+
+### Other PHP projects (Symfony, Slim, custom apps, libraries)
+
+There is **no** Laravel service provider. Install the same Composer package and **configure the tracer in your bootstrap** (or a DI container):
+
+```bash
+cd /path/to/your-php-project
+composer require bilge/tracing
+```
+
+Then wire **Bilge ingest** explicitly, for example:
+
+```php
+use Bilge\Tracing\Tracer;
+
+Tracer::instance()->configure([
+    'api_key' => getenv('BILGE_API_KEY') ?: null,
+    'base_uri' => rtrim((string) getenv('BILGE_URL'), '/') ?: null,
+    'environment' => getenv('APP_ENV') ?: null,
+]);
+```
+
+Use **`Tracer`**, **`Tracing`**, **`bilge_logger()`**, **`bilge_metrics()`**, PSR-15 middleware (e.g. `ContinueTracePsr15Middleware`), and **`GuzzleTraceMiddleware`** as needed; see **Propagation**, **Custom instrumentation**, **Bilge ingest**, and **Guzzle 7** below. For Slim / Mezzio, see the `slim/slim` suggestion in `composer.json`.
+
+(This monorepo keeps the package source at `packages/bilge-tracing`. The Bilge app installs the published `bilge/tracing` package from Packagist so container deploys do not depend on a local path repository.)
+
+## Propagation
+
+- **Incoming:** parse the compact trace header (see `Bilge\Tracing\TraceWireHeaders::HTTP_TRACEPARENT`) and `baggage` (e.g. from `PSR-7` request headers or Laravel’s `Request`).
+- **Outgoing:** add the same headers to downstream HTTP calls so other services can continue the trace.
+
+```php
+use Bilge\Tracing\Tracer;
+use Bilge\Tracing\TraceWireHeaders;
+
+Tracer::instance()->continueTrace(
+    $request->getHeaderLine(TraceWireHeaders::HTTP_TRACEPARENT),
+    $request->getHeaderLine(TraceWireHeaders::HTTP_BAGGAGE),
+);
+
+$headers = Tracer::instance()->outgoingTraceHeaders();
+// keys: TraceWireHeaders::HTTP_TRACEPARENT, TraceWireHeaders::HTTP_BAGGAGE
+```
+
+HTML meta tags for browser SDKs:
+
+```php
+use Bilge\Tracing\HtmlTraceMeta;
+
+echo HtmlTraceMeta::render();
+```
+
+## Custom instrumentation
+
+```php
+use Bilge\Tracing\SpanOperation;
+use Bilge\Tracing\Tracing;
+
+$tx = Tracing::startTransaction('GET /orders', SpanOperation::HTTP_SERVER);
+
+Tracing::trace(function () {
+    // …
+}, SpanOperation::HTTP_CLIENT, 'GET https://api.example.com/v1/orders');
+
+$tx->finish();
+```
+
+Common `op` values are defined on `Bilge\Tracing\SpanOperation` (`http.server`, `http.client`, `db.query`, `cache.get`, `queue.publish`, etc.).
+
+## Bilge ingest
+
+- **`Tracer::errorIngestTraceFields()`** — `trace_id`, `span_id`, `parent_span_id`, `transaction` for your error JSON body to `POST /api/ingest`.
+- **`Tracer::errorIngestPerformanceGroupingHints()`** — when **`reporting.performance_grouping.enabled`** is true (env **`BILGE_REPORT_PERFORMANCE_GROUPING`**) and **`performance_enabled`** recorded spans in the same request, may add **`grouping_slow_path`** and **`grouping_db_time_ms`** so Bilge can fingerprint slow / DB-heavy errors separately (see Bilge ingest docs).
+- **`Tracer::configure([...])`** + **`Tracer::flush()`** — send finished spans to `POST /api/ingest/trace` (set `api_key`, `base_uri`, optional `environment` / `release`). Use **`Tracer::flushWithResult()`** (or **`Tracing::flushWithResult()`**) when you need the HTTP **status** (e.g. **403** if the Bilge project disabled trace ingest).
+
+## Structured logs
+
+**`bilge_logger()->info('User %s logged in', ['alice'])`**, optional **`flush()`**, and a **Monolog** handler. Rows go to **`POST /api/ingest/log`** with the same **`api_key`** / **`base_uri`** as tracing; enabled from the dashboard (**Monitoring → Signals**), with **`BILGE_LOGS_ENABLED`** as a local override (env > site). Laravel registers a **terminating** flush when **`logging.enabled`** and **`logging.flush_on_terminate`** are true. Long workers should call **`bilge_logger()->flush()`** on a timer or after batches.
+
+```php
+bilge_logger()->info('order placed', null, ['order_id' => '42']);
+bilge_logger()->flush();
+```
+
+```php
+use Bilge\Tracing\Logging\Monolog\BilgeMonologHandler;
+use Monolog\Logger;
+
+$log = new Logger('app');
+$log->pushHandler(new BilgeMonologHandler());
+```
+
+## Custom metrics
+
+**`bilge_metrics()->count('orders.completed', 1)`**, **`gauge()`**, **`distribution()`**, optional **`MetricUnit`**, and **`flush()`**. Samples go to **`POST /api/ingest/metric`**; the active **`trace_id`** is attached when a transaction is in flight so the Bilge UI can correlate rollups with traces. Enabled from the dashboard (**Monitoring → Signals**), with **`BILGE_METRICS_ENABLED`** as a local override (env > site). Laravel flushes on **terminating** when **`metrics.enabled`** and **`metrics.flush_on_terminate`** are true.
+
+Optional **`MetricsIngestClient::configure(['before_send_metric' => fn (array $row): ?array => $row])`** drops or mutates rows before enqueue (return **`null`** to skip).
+
+```php
+use Bilge\Tracing\Metrics\MetricUnit;
+
+bilge_metrics()->count('button.click', 5, ['plan' => 'pro']);
+bilge_metrics()->distribution('page.load_ms', 42.5, ['route' => '/checkout'], MetricUnit::millisecond());
+bilge_metrics()->flush();
+```
+
+### Real User Monitoring (browser)
+
+Optional **Web Vitals** + **SPA / Livewire** navigation beacons: `POST /api/ingest/rum` (same project API key; **performance ingest** must be enabled on the project). Vanilla script with no npm dependencies:
+
+- **`resources/rum/bilge-rum.js`** — `BilgeRum.init({ endpoint, apiKey, livewireNavigate: true, traceId: () => … })`. Puts **`api_key` in the JSON body** so **`navigator.sendBeacon`** works without custom headers. Correlate with server traces via **`trace_id`** (32 hex), e.g. from **`HtmlTraceMeta`** / a `<meta name="bilge-trace-id">` you render from `Tracer::instance()->traceId` on the server.
+
+## Error reporting client
+
+Uncaught exceptions use **`Bilge\Tracing\Reporting\ErrorReportClient`**: middleware enriches the payload (Laravel + HTTP context, git metadata, `context.attributes` from **`Bilge\Tracing\Reporting\ReportScope`** and configurable **`AttributeProviderInterface`** classes, optional **`client_solutions`** strings), then **`ReportTruncator`** enforces Bilge size limits, optional **`ReportSampler`** drops a random fraction, and the payload is POSTed immediately or **queued** and flushed on **shutdown** (`reporting.queue` / `reporting.send_immediately`).
+
+### Glows (Flare-style manual breadcrumbs)
+
+Similar in spirit to [Flare Laravel glows](https://flareapp.io/docs/laravel/data-collection/glows): **custom timeline notes** that appear with other **breadcrumbs** on the error in Bilge (chronological “what ran before this failed”).
+
+```php
+use Bilge\Tracing\GlowBreadcrumb;
+
+GlowBreadcrumb::glow('Payment branch: validated wallet', 'info', ['wallet_id' => $id]);
+GlowBreadcrumb::glow('Skipping cache (feature flag)', 'debug');
+```
+
+- **`$message`** — required; trimmed, max length enforced with other breadcrumbs.
+- **`$level`** — string such as `debug`, `info`, `warning`, `error` (default `info`).
+- **`$data`** — optional associative array (subject to the same redaction as other breadcrumb payloads).
+
+Internally these are breadcrumbs with **`type`** `glow` and **`category`** `glow`. They are **not** the Spatie **`Flare::glow()`** API—there is no drop-in facade. They attach to the **error ingest** breadcrumb list, not as separate **span events** on traces (Flare also shows glows on spans in performance; Bilge’s buffer is scoped to the next error report).
+
+### Manual filesystem breadcrumbs
+
+For disk I/O there is no universal Laravel hook; use **`FilesystemBreadcrumb::record()`**:
+
+```php
+use Bilge\Tracing\FilesystemBreadcrumb;
+
+FilesystemBreadcrumb::record('read', '/var/app/config.json', 'info', ['bytes' => 1024]);
+```
+
+Optional **breadcrumb recorders** (same config block as core instrumentation, `instrumentation.enabled` must be true): **cache** hits/misses, **Redis** commands, **views** (view composer `*`), **outbound HTTP** (`Illuminate\Http\Client` events), **response** metadata (`ResponsePrepared`), **database transactions** (`TransactionBeginning` / `Committed` / `RolledBack`), **`dump()`** via Symfony VarDumper, plus manual **`Bilge\Tracing\GlowBreadcrumb::glow()`** and **`Bilge\Tracing\FilesystemBreadcrumb::record()`**. Env flags: `BILGE_INSTRUMENT_CACHE`, `_REDIS`, `_VIEWS`, `_OUTBOUND_HTTP`, `_RESPONSE_DETAIL`, `_DATABASE_TRANSACTIONS`, `_DUMP`. Set **`BILGE_INSTRUMENT_COMPREHENSIVE_COLLECTION=true`** to turn on the optional recorders above (plus SQL breadcrumbs and performance collectors for cache, Redis, views, log) in one step.
+
+**Broad Laravel error context (what maps where)**
+
+| Area | Bilge |
+|------|---------|
+| Application info | `context.laravel`: framework + PHP version, **application name**, **locale**, **config cached**, **debug**, **application_env** (`APP_ENV`), route/command/queue hints |
+| Laravel context | Same `context.laravel` + **`context.log_context`** from `context()` / `Illuminate\Log\Context\Repository` |
+| Exception context | **`context.exception_context`** when the throwable implements **`context()`** (redacted) |
+| Stacktrace arguments | Structured **`stack_frames[].args`** when `reporting.include_stack_arguments` is true and PHP supplies trace args (`zend.exception_ignore_args=0`) |
+| Requests / URL / user | `url`, `user`, `issue_route`, `context.server`; HTTP breadcrumbs |
+| Server info | `context.server` (hostname, SAPI, OS, pid, limits, tz) + request `SERVER_ADDR` when present |
+| Git information | Default **`GitInformationMiddleware`** (commit, etc.) |
+| Solutions | **`SolutionsMiddleware`** + `reporting.client_solutions` |
+| Console commands | Breadcrumbs + performance spans when enabled |
+| Jobs and queues | Breadcrumbs + queue trace propagation + performance |
+| Queries | Sampled SQL breadcrumbs (default on); **DB spans** with fingerprint, bindings, slow flag + root rollup (`db.total_duration_ms`, `db.slow_query_count`) when performance DB collector on |
+| Database transactions | Breadcrumbs when `instrumentation.database_transactions` or `comprehensive_collection` |
+| Cache events | Cache breadcrumbs (default on) + cache **spans** (default on when performance enabled) |
+| Redis commands | Breadcrumbs + optional Redis **spans** |
+| External HTTP | Breadcrumbs + **http.client** spans (Guzzle / `Http::`) |
+| Views | View composer breadcrumbs + optional view **spans** |
+| Logs | Optional `MessageLogged` breadcrumbs; optional log **spans**; structured **`/api/ingest/log`** via `bilge_logger()` |
+| Livewire | **`context.livewire`** (component class + name) on Livewire requests |
+| Spans / errors when tracing | **`BILGE_PERFORMANCE_ENABLED`**, `Tracer::markTraceMustExport` on error reports |
+| Dumps | `instrumentation.dump` → **`DumpInstrumentation`** |
+| Glows / filesystem | Manual **`GlowBreadcrumb::glow()`**, **`FilesystemBreadcrumb::record()`** |
+| Customise report | **`reporting.middleware`**, **`AttributeProviderInterface`**, **`ReportScope`** |
+
+Global no-op: `BILGE_DISABLED` or `reporting.disabled`. Ingest fields **`is_log`**, **`open_frame_index`**, and **`grouping_override`** (custom fingerprint when `fingerprint` is empty; camelCase aliases **`isLog`**, **`openFrameIndex`**, **`overriddenGrouping`**) are stored on the server. In the Bilge app, **Project → Monitoring → Signals** turns each signal type on/off per project while leaving error ingest always on.
+
+### Signal control: dashboard + env overrides
+
+Which signals are captured/sent is controlled from the Bilge dashboard (**Project → Monitoring → Signals**) and fetched by the SDK at boot via **`GET /api/config`** (cached for **`BILGE_REMOTE_CONFIG_TTL`**, default 300s; disable the whole mechanism with **`BILGE_REMOTE_CONFIG=false`**). Sample rates sync the same way. This replaced the per-signal `BILGE_*_MONITORING_ENABLED` / `*_ENABLED` env vars as the *primary* switch and the old `BILGE_PERFORMANCE_SYNC_FROM_API` (+ `BILGE_SYNC_API_TOKEN`, `BILGE_SYNC_PROJECT_ID`), which are gone.
+
+**Precedence is env > site:** an explicitly-set `BILGE_*_ENABLED` / `*_SAMPLE_RATE` still wins over the dashboard. When env force-enables a signal the dashboard has off, the SDK sends **`X-Bilge-Env-Forced`** so the server accepts it, and reports its env overrides on the config fetch so the dashboard shows them as "Set by env."
+
+### User feedback (crash page)
+
+When **`ErrorReportClient`** builds an error payload it ensures an **`occurrence_uuid`** (v4) and remembers it for **`bilge_last_error_occurrence_uuid()`** / **`ErrorReportClient::lastOccurrenceUuid()`**. On your custom error view, POST that UUID with the user’s message to **`POST /api/ingest/feedback`** (same project **`api_key`**; see Bilge **Ingest API → User feedback**). The comment appears on that occurrence’s thread in the app. Alternatively use the ingest response / read API **`event_id`** (ULID) as **`event_id`** in the feedback body.
+
+## Cron monitors
+
+Monitor check-ins: `in_progress` → `ok` / `error`, optional heartbeat, and monitor upsert via `monitor_config`.
+
+```php
+use Bilge\Tracing\Cron\CheckInStatus;
+use Bilge\Tracing\Cron\Client as CronClient;
+use Bilge\Tracing\Cron\MonitorConfig;
+use Bilge\Tracing\Cron\MonitorSchedule;
+
+CronClient::configure([
+    'api_key' => getenv('BILGE_API_KEY'),
+    'base_uri' => 'https://your-bilge-host.example',
+    'cron_ingest_path' => '/api/ingest/cron',
+]);
+
+$config = MonitorConfig::make(MonitorSchedule::crontab('0 * * * *'), checkinMarginMinutes: 5);
+
+$id = CronClient::captureCheckIn('hourly-job', CheckInStatus::inProgress(), monitorConfig: $config);
+CronClient::captureCheckIn('hourly-job', CheckInStatus::ok(), $id);
+
+CronClient::withMonitor('wrapped-job', fn () => doWork(), $config);
+
+CronClient::captureCheckIn('heartbeat', CheckInStatus::ok(), null, 12.0);
+```
+
+Optional **`meta`** (string/number/bool values, size-limited server-side) on `captureCheckIn` attaches context to the check-in row and merges on completion.
+
+Laravel: the same service provider configures `CronClient` from `config/bilge-tracing.php` (`cron_ingest_path` defaults to `/api/ingest/cron`).
+
+## Profiling (CPU / flame graphs)
+
+### Automatic (Laravel + Excimer) — zero code
+
+If the **Excimer** PECL extension is installed, turn on auto-profiling and the package captures a
+sampled fraction of web requests, console commands, and queue jobs and uploads them for you — no
+`ProfileClient::sendProfile()` calls. Without Excimer this is a silent no-op (use the manual paths below),
+and it never throws into your app.
+
+```env
+BILGE_PROFILING_ENABLED=true
+BILGE_PROFILING_SAMPLE_RATE=0.05   # 5% of transactions (keep low — each profile counts toward your event quota)
+BILGE_PROFILING_PERIOD_US=10000    # sample period in microseconds (10ms)
+BILGE_PROFILING_EVENT_TYPE=wall    # 'wall' (default) or 'cpu'
+BILGE_PROFILING_MIN_DURATION_MS=0  # only upload transactions at least this slow
+```
+
+Auto-profiling rides on performance instrumentation, so keep `performance.enabled = true`. `trace_id`,
+`transaction`, `environment`, and `release` are attached automatically so profiles cross-link from traces
+and errors. For non-Laravel apps or when Excimer is unavailable, capture manually:
+
+### Manual capture
+
+Capture with **Excimer** (speedscope JSON), **xhprof** / **Tideways**, **SPX**, or cooperative **`php.manual_pulse`** sampling (no extension), then POST to Bilge.
+
+```php
+use Bilge\Tracing\Profiling\ProfileClient;
+
+ProfileClient::configure([
+    'api_key' => getenv('BILGE_API_KEY'),
+    'base_uri' => 'https://your-bilge-host.example',
+    'profile_ingest_path' => '/api/ingest/profile',
+]);
+
+ProfileClient::sendProfile([
+    'agent' => 'other',
+    'format' => 'speedscope',
+    'data' => [/* speedscope JSON object */],
+    'trace_id' => 'abc123…',
+    'transaction' => 'GET /checkout',
+]);
+```
+
+**First-party aggregate hotspots** (`bilge.v1`):
+
+```php
+use Bilge\Tracing\Profiling\BilgeProfileV1Payload;
+use Bilge\Tracing\Profiling\ProfileClient;
+
+ProfileClient::sendProfile(BilgeProfileV1Payload::aggregateIngestBody(
+    [
+        ['file' => 'app/Services/Checkout.php', 'line' => 120, 'samples' => 48],
+    ],
+    meta: ['source' => 'custom-collector'],
+    context: ['trace_id' => 'abc123…', 'transaction' => 'POST /checkout'],
+));
+```
+
+Package classes under `Bilge\Tracing\Profiling\` (e.g. `ExcimerExporter`, `XhprofLikeExporter`, `SpxPayload`, `ManualPulseSampler`, `BilgeProfileV1Payload`) help build `agent` / `format` / `data` for each backend. Laravel: `BilgeTracingServiceProvider` merges the same `api_key`, `base_uri`, and `profile_ingest_path` from `config/bilge-tracing.php`.
+
+**Overhead:** Bilge does not sample profiles for you — wrap `ProfileClient::sendProfile()` (or your Excimer/Tideways hooks) so production only uploads a small fraction of requests or when duration exceeds a threshold, similar to `profiles_sample_rate` / slow-transaction rules elsewhere.
+
+## Laravel
+
+Auto-discovery registers `Bilge\Tracing\Laravel\BilgeTracingServiceProvider`.
+
+### Quick install
+
+```bash
+composer require bilge/tracing
+php artisan bilge:install
+```
+
+`bilge:install` can either **create a project** on your Bilge instance (API token from Profile → API tokens + base URL) or **use an existing DSN**. Either way it appends to `.env`:
+
+```dotenv
+BILGE_DSN="https://YOUR_PROJECT_API_KEY@your-bilge-host.example.com"
+BILGE_LARAVEL=true
+```
+
+- **`BILGE_DSN`** — single line: `https://` + **project ingest API key** as the URL user + `@` + Bilge host (optional port). Percent-encode the key if it contains `@` or other reserved characters. The create-project flow obtains this key from the API after `POST /api/v1/projects`.
+- **`BILGE_LARAVEL=true`** — enables **uncaught exception reporting** (`BILGE_REPORT_EXCEPTIONS`) and **trace auto-flush on HTTP terminate** (`BILGE_TRACING_AUTO_FLUSH`) unless you override those env vars explicitly.
+
+Non-interactive:
+
+- Existing project: `php artisan bilge:install --dsn="https://PROJECT_KEY@host.example.com"`.
+- New project: `php artisan bilge:install --url="https://host.example.com" --token="your_api_token"` (and **`--organization=ULID`** if your account has more than one organization). Optional **`--project-name="My App"`**. On the same Laravel host (e.g. this Bilge app), you can omit **`--url`** when **`APP_URL`** is set: `--token="…"` alone uses that origin.
+
+Pass **`--no-quick`** to skip `BILGE_LARAVEL=true`.
+
+**API key only (team shares one Bilge URL):** set a default host once — `BILGE_URL`, `BILGE_BASE_URI`, or `config/services.php` → **`bilge.url`** — then each environment only needs **`BILGE_API_KEY`**.
+
+- Middleware alias: **`bilgeTracing.continueTrace`** — call `continueTrace()` from incoming headers.
+- Publish config: `php artisan vendor:publish --tag=bilge-tracing-config`
+- Env resolution order for **base URI**: `BILGE_DSN` host → `BILGE_BASE_URI` → `BILGE_URL` → `config('services.bilge.url')` → `APP_URL`. Profile ingest path defaults to `/api/ingest/profile` (override in published config).
+
+### Framework breadcrumbs & exception reporting
+
+The provider registers **event listeners** (when `instrumentation.enabled` is true) that append **breadcrumbs** for:
+
+| Area | Laravel events (indicative) |
+|------|----------------------------|
+| HTTP | `RouteMatched`, `RequestHandled` |
+| Console | `CommandStarting`, `CommandFinished` |
+| Queue | `JobProcessing`, `JobProcessed`, `JobFailed`, `JobExceptionOccurred` |
+| Optional | `QueryExecuted` (sampled), `MessageLogged`, allowlisted domain events, or a wildcard listener |
+
+Breadcrumbs are **cleared** at each route match, Artisan command, or queue job so `queue:work` and Octane do not mix unrelated requests.
+
+With **`BILGE_LARAVEL=true`** or **`BILGE_REPORT_EXCEPTIONS=true`** (and a resolved API key + base URI), the provider registers a **`reportable`** handler on the default exception handler. It POSTs to **`POST /api/ingest`** with:
+
+- exception message, class, stack trace, and **stack frames**
+- current **breadcrumbs**
+- **trace** fields from `Tracer::errorIngestTraceFields()` when a transaction was started
+- **`context.laravel`**: framework version, PHP version, route, queue job name, Artisan command, HTTP path/method when available
+
+Tune knobs in `config/bilge-tracing.php` (`instrumentation.*`, `breadcrumbs_max`, `error_ingest_path`).
+
+### Performance monitoring (traces & spans)
+
+Enabled from the dashboard (**Monitoring → Signals**), with **`BILGE_PERFORMANCE_ENABLED`** as a local override (env > site); needs a resolved API key and base URI from **`BILGE_DSN`**, **`BILGE_API_KEY`** + **`BILGE_URL`**, etc. This turns on **sampled span recording**: OpenTelemetry-style **trace ids**, **spans**, and optional **span events**, sent to **`POST /api/ingest/trace`** via `Tracer::flush()` or **`BILGE_TRACING_AUTO_FLUSH=true`**. If the project has trace ingest off in **Monitoring → Signals** the SDK stops sending (or sends **`X-Bilge-Env-Forced`** when env forces it on); otherwise the API returns **403**.
+
+1. **Middleware (order matters):** register **`bilgeTracing.continueTrace`** first, then **`bilgeTracing.performance`**, or set **`BILGE_PERFORMANCE_AUTO_MIDDLEWARE=true`** to append only the performance middleware to `web` and `api` (you still add `continueTrace` yourself if it is not already in those groups).
+2. **Sampling:** default **`RateSampler`** at **10%** (`BILGE_PERFORMANCE_SAMPLE_RATE=0.1`). Implement `Bilge\Tracing\Performance\Sampler` and set `performance.sampler.class` for custom logic. Traces continued from an incoming traceparent with **`sampled=0`** never record spans (propagation only). Optional **tail sampling** (`BILGE_PERFORMANCE_TAIL_SAMPLING=true`): keep slow roots (`BILGE_PERFORMANCE_TAIL_SLOW_MS`), errors / 5xx, optional `BILGE_PERFORMANCE_TAIL_RESIDUAL_RATE` for a thin random sample of the rest — same theme as lowering head sample rates in production while still capturing outliers.
+3. **Limits:** `performance.trace_limits` — max spans per export, max attributes per span / span event, max span events per span.
+4. **Hooks:** `Tracing::configureSpans(fn (Span $span) => …)` and `Tracing::configureSpanEvents(fn (array $event) => …|null)` — return **`null`** from the span-event callback to drop an event.
+5. **Collectors** (`performance.collectors.*`): HTTP server transaction, **database** queries (child `db.query` spans), **console** / **queue** root transactions, **log** lines as span events, and **HTTP client** spans when you attach **`GuzzleTraceMiddleware`** (see below).
+
+CLI / queue: enable **`BILGE_PERFORMANCE_FLUSH_CLI_QUEUE=true`** to flush after each command or job, or call **`Tracing::flush()`** yourself.
+
+## Rails
+
+For Ruby on Rails, use the copy-paste module under **`packages/bilge-rails/`** in the Bilge repository (`lib/bilge_framework.rb` + README), or a git subtree mirror if you use `SPLIT_BILGE_RAILS_REPO`: `ActiveSupport::Notifications` for controller and Active Job, optional SQL sampling, and `BilgeFramework.report_exception` from your error pipeline.
+
+## Guzzle 7
+
+```php
+use GuzzleHttp\Client;
+use GuzzleHttp\HandlerStack;
+use Bilge\Tracing\Http\GuzzleTraceMiddleware;
+
+$stack = HandlerStack::create();
+$stack->push(GuzzleTraceMiddleware::create());
+
+$client = new Client(['handler' => $stack]);
+```
+
+With **performance monitoring** enabled, the same middleware also records **`http.client`** child spans (when a parent span is active and sampling allows recording).
+
+## Requirements
+
+- PHP 8.3+
+- `psr/http-message` (for the optional Guzzle middleware type hints)
+- `guzzlehttp/guzzle` (optional, for `GuzzleTraceMiddleware` + promises)
+
+## SDK roadmap & Bilge alignment
+
+The Bilge app surfaces **Traces**, **Transactions**, and **trace detail** in the web UI; the SDK sends **errors** (`POST /api/ingest`) and, when enabled, **spans** (`POST /api/ingest/trace`) with consistent **`trace_id`** and compact traceparent propagation.
+
+| Server behavior | SDK support |
+|-----------------|-------------|
+| **`performance_ingest_enabled`** false | Trace ingest returns **403**. The SDK reads this from remote config (see below) and stops sending traces to match the dashboard — no 403 spam. Override locally with **`BILGE_PERFORMANCE_ENABLED`** (env > site); when env forces it on, the SDK sends **`X-Bilge-Env-Forced`** so the server accepts it. Auto-flush and queue/cli flush log **`bilge.tracing.trace_forbidden`** when **`performance.log_forbidden_trace_ingest`** is true (default). |
+| **`GET /api/config`** | **`RemoteConfig::fetch()`** — per-project enabled flags + sample rates, cached and applied at boot (replaces the old `performance.sync_from_api` / `GET /api/v1/projects/{id}` path). |
+| **429 / flaky network** | **`trace_ingest.max_attempts`**, **`retry_delay_ms`**, **`retry_statuses`** (env: **`BILGE_TRACE_INGEST_*`**) — **`Tracer::flushWithResult()`** uses **`HttpTransport::postJsonWithResponseRetries()`**. **403** is never retried. |
+
+### Implemented building blocks
+
+- **`Bilge\Tracing\Interop\OpenTelemetryTraceConverter`** — OTLP JSON → Bilge: **`toJobPayloads()`** (one row set per `traceId`), **`toBilgeIngestBody()`** when only one trace is present, **`fromBilgeIngestBody()`** for OTLP export from native bodies. Bilge HTTP: **`POST /api/ingest/trace/otlp`** (same auth/gate as **`/api/ingest/trace`**).
+- **`Bilge\Tracing\Http\ContinueTracePsr15Middleware`** — PSR-15 traceparent / **`baggage`** parsing (Slim, Mezzio, etc.).
+- **`Bilge\Tracing\Support\DataRedactor::redact()`** — recursive redaction for span **`data`** / context-style arrays.
+- **`Bilge\Tracing\Testing\TracerInspection::traceIngestBody()`** — stable access to **`buildTraceIngestBody()`** in tests.
+
+### Still optional / app-specific
+
+- Dedicated **OpenTelemetry PHP SDK** exporter package (protobuf / gRPC) — HTTP JSON ingest is covered by **`/api/ingest/trace/otlp`** and the converter.
+- **PSR-15 “performance”** middleware (auto HTTP transactions) — today use manual **`Tracing::startTransaction`** or stay on Laravel.
+- **Queue-based async flush** with deduplication across workers.
+
+## Scope
+
+**Tracing** supports **manual** transactions/spans (`Tracing::trace()`, `startTransaction`) and optional **performance mode**: sampled **auto spans** for HTTP (middleware), SQL, Artisan, queue, logs, and outbound Guzzle calls, flushed to Bilge’s trace ingest.
+
+**Framework instrumentation** (above) still records **breadcrumbs** for **error reports**; performance collectors add **span trees** for the distributed trace UI when you flush to **`/api/ingest/trace`**.
+
+**Crons:** Bilge stores check-ins and monitor metadata; it does **not** yet auto-open issues or email you on missed schedules like some hosted cron products—you can build alerting on top (e.g. scheduled jobs reading the API) or extend the app later.

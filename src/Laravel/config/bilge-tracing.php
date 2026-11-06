@@ -1,0 +1,909 @@
+<?php
+
+declare(strict_types=1);
+
+use Bilge\Tracing\Performance\RateSampler;
+use Bilge\Tracing\Support\EnvOverrides;
+use Bilge\Tracing\Support\BilgeDsn;
+use Bilge\Tracing\Support\MonitoringEnv;
+
+$bilgeDsn = BilgeDsn::parse(trim((string) env('BILGE_DSN', '')));
+
+$trimEnvUrl = static function (string $key): ?string {
+    $v = env($key);
+    if (! is_string($v)) {
+        return null;
+    }
+    $t = rtrim(trim($v), '/');
+
+    return $t !== '' ? $t : null;
+};
+
+$servicesBilgeUrl = null;
+if (function_exists('config')) {
+    $u = config('services.bilge.url');
+    if (is_string($u)) {
+        $t = rtrim(trim($u), '/');
+        $servicesBilgeUrl = $t !== '' ? $t : null;
+    }
+}
+
+$baseUri = $bilgeDsn['base_uri']
+    ?? $trimEnvUrl('BILGE_BASE_URI')
+    ?? $trimEnvUrl('BILGE_URL')
+    ?? $servicesBilgeUrl
+    ?? $trimEnvUrl('APP_URL');
+
+$apiKey = $bilgeDsn['api_key'] ?? env('BILGE_API_KEY');
+$apiKey = is_string($apiKey) && $apiKey !== '' ? $apiKey : null;
+
+$laravelQuickStart = filter_var((string) env('BILGE_LARAVEL', ''), FILTER_VALIDATE_BOOLEAN);
+
+$reportExceptions = env('BILGE_REPORT_EXCEPTIONS');
+$reportExceptions = $reportExceptions !== null
+    ? filter_var($reportExceptions, FILTER_VALIDATE_BOOLEAN)
+    : $laravelQuickStart;
+
+$tracingAutoFlush = env('BILGE_TRACING_AUTO_FLUSH');
+$tracingAutoFlush = $tracingAutoFlush !== null
+    ? filter_var($tracingAutoFlush, FILTER_VALIDATE_BOOLEAN)
+    : $laravelQuickStart;
+
+return [
+    /*
+    |--------------------------------------------------------------------------
+    | Disable all Bilge tracing / reporting clients (no-op)
+    |--------------------------------------------------------------------------
+    */
+    'disabled' => env('BILGE_DISABLED', false),
+    /*
+    |--------------------------------------------------------------------------
+    | Bilge API key
+    |--------------------------------------------------------------------------
+    |
+    | Set BILGE_API_KEY, or use a single BILGE_DSN (https://KEY@host) from php artisan bilge:install.
+    |
+    */
+    'api_key' => $apiKey,
+
+    /*
+    |--------------------------------------------------------------------------
+    | Bilge base URL
+    |--------------------------------------------------------------------------
+    |
+    | Scheme + host + optional port, no trailing slash. Resolved from BILGE_DSN, then BILGE_BASE_URI,
+    | BILGE_URL, config('services.bilge.url'), then APP_URL (self-hosted Bilge on the same URL).
+    |
+    */
+    'base_uri' => $baseUri,
+
+    'ingest_trace_path' => '/api/ingest/trace',
+
+    'cron_ingest_path' => '/api/ingest/cron',
+
+    'job_ingest_path' => '/api/ingest/job',
+
+    'mail_ingest_path' => env('BILGE_MAIL_INGEST_PATH', '/api/ingest/mail'),
+
+    'event_ingest_path' => env('BILGE_EVENT_INGEST_PATH', '/api/ingest/event'),
+
+    'notification_ingest_path' => env('BILGE_NOTIFICATION_INGEST_PATH', '/api/ingest/notification'),
+
+    'model_ingest_path' => env('BILGE_MODEL_INGEST_PATH', '/api/ingest/model'),
+
+    'gate_ingest_path' => env('BILGE_GATE_INGEST_PATH', '/api/ingest/gate'),
+
+    'profile_ingest_path' => '/api/ingest/profile',
+
+    /*
+    |--------------------------------------------------------------------------
+    | Automatic profiling (Excimer)
+    |--------------------------------------------------------------------------
+    |
+    | When enabled AND the Excimer PECL extension is installed, a sampled fraction of
+    | transactions (web requests, console commands, queue jobs) are CPU/wall profiled and
+    | POSTed to /api/ingest/profile automatically — no ProfileClient::sendProfile() calls.
+    | Without Excimer this is a silent no-op. Profiling rides on performance instrumentation,
+    | so keep performance.enabled = true. Each uploaded profile counts toward your event quota,
+    | so keep sample_rate low in production. event_type: 'wall' (default) or 'cpu'.
+    |
+    */
+    /*
+    |--------------------------------------------------------------------------
+    | Remote config
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, the SDK fetches GET /api/config from Bilge (authenticated with this
+    | project's api_key) and lets the dashboard decide which signals are captured/sent. The
+    | config is cached for `ttl` seconds and refreshed after the response (never blocking a
+    | request); until the first fetch lands, the built-in defaults below apply. This replaces
+    | the per-signal BILGE_*_MONITORING_ENABLED env toggles and the old performance sync.
+    |
+    */
+    'remote_config' => [
+        'enabled' => filter_var(env('BILGE_REMOTE_CONFIG', true), FILTER_VALIDATE_BOOLEAN),
+        'ttl' => (int) env('BILGE_REMOTE_CONFIG_TTL', 300),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Env overrides (env > site)
+    |--------------------------------------------------------------------------
+    |
+    | Explicitly-set per-signal env vars (BILGE_*_ENABLED / *_SAMPLE_RATE) win over the
+    | dashboard's remote config. Detected here (in the config file, so it survives config caching)
+    | and applied on top of remote config at boot. Reported to the dashboard so it can show which
+    | signals your environment is pinning.
+    |
+    */
+    'env_overrides' => EnvOverrides::detect(),
+
+    'profiling' => [
+        // On by default for standard (quick-start) installs, like the other collectors. Safe without the
+        // Excimer extension (capture is a guarded no-op); with Excimer + follow_trace_sampling, every
+        // sampled trace gets a linkable CPU profile. Set BILGE_PROFILING_ENABLED=false to opt out.
+        'enabled' => MonitoringEnv::resolveEnabled(env('BILGE_PROFILING_ENABLED'), $laravelQuickStart),
+        'sample_rate' => (float) env('BILGE_PROFILING_SAMPLE_RATE', $laravelQuickStart ? 0.05 : 0.0),
+        // When true (default), profiling follows the trace sampling decision: every transaction whose
+        // trace is recorded is profiled, so each sampled trace carries a linkable CPU profile and
+        // `sample_rate` is ignored. Set false to fall back to the independent `sample_rate` draw.
+        'follow_trace_sampling' => MonitoringEnv::resolveEnabled(env('BILGE_PROFILING_FOLLOW_TRACE_SAMPLING'), true),
+        'period_us' => (int) env('BILGE_PROFILING_PERIOD_US', 10000),
+        'event_type' => env('BILGE_PROFILING_EVENT_TYPE', 'wall'),
+        'min_duration_ms' => (int) env('BILGE_PROFILING_MIN_DURATION_MS', 0),
+        'max_samples' => (int) env('BILGE_PROFILING_MAX_SAMPLES', 10000),
+        // Off by default: without Excimer the cooperative pulse sampler only snapshots the
+        // begin/end of a capture — both inside the framework/middleware pipeline — so an
+        // auto-profiled request yields a profile dominated by the pipeline and the SDK's own
+        // frames rather than real application work. Opt in explicitly for deliberate
+        // bilge_profiles()->time()/profile() cooperative sampling.
+        'manual_pulse_fallback' => MonitoringEnv::resolveEnabled(env('BILGE_PROFILING_MANUAL_PULSE_FALLBACK'), false),
+    ],
+
+    'log_ingest_path' => env('BILGE_LOG_INGEST_PATH', '/api/ingest/log'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Structured log ingest (bilge_logger + Monolog)
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, bilge_logger()->info(...) buffers rows for POST /api/ingest/log.
+    | With BILGE_LOGS_FLUSH_ON_TERMINATE=true (default), Laravel flushes at the end of each
+    | request (terminating callback). Call bilge_logger()->flush() manually in long workers.
+    |
+    */
+    'logging' => [
+        'enabled' => $laravelQuickStart,
+        'sample_rate' => (float) env('BILGE_LOGS_SAMPLE_RATE', 1.0),
+        'flush_on_terminate' => (bool) env('BILGE_LOGS_FLUSH_ON_TERMINATE', true),
+        'max_buffer' => (int) env('BILGE_LOGS_MAX_BUFFER', 50),
+    ],
+
+    'metric_ingest_path' => env('BILGE_METRIC_INGEST_PATH', '/api/ingest/metric'),
+
+    'dump_ingest_path' => env('BILGE_DUMP_INGEST_PATH', '/api/ingest/dump'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Dump capture ingest (bilge_dump + native dump()/dd())
+    |--------------------------------------------------------------------------
+    |
+    | When enabled (opt-in; tie to instrumentation.dump for native dump()/dd() capture), values are
+    | serialized into a normalized, redacted tree and buffered for POST /api/ingest/dump, flushed at
+    | the end of each request. Heavy entries, so batches and per-request counts are kept small. Secrets
+    | are redacted by key before they ever leave the process.
+    |
+    */
+    'dumps' => [
+        'enabled' => env('BILGE_DUMPS_ENABLED', false),
+        'sample_rate' => (float) env('BILGE_DUMPS_SAMPLE_RATE', 1.0),
+        'flush_on_terminate' => (bool) env('BILGE_DUMPS_FLUSH_ON_TERMINATE', true),
+        'max_batch' => (int) env('BILGE_DUMPS_MAX_BATCH', 20),
+        'max_per_request' => (int) env('BILGE_DUMPS_MAX_PER_REQUEST', 100),
+        'serializer' => [
+            'max_depth' => (int) env('BILGE_DUMPS_MAX_DEPTH', 6),
+            'max_children' => (int) env('BILGE_DUMPS_MAX_CHILDREN', 100),
+            'max_string' => (int) env('BILGE_DUMPS_MAX_STRING', 8192),
+            'max_total_bytes' => (int) env('BILGE_DUMPS_MAX_TOTAL_BYTES', 262144),
+        ],
+    ],
+
+    'security_ingest_path' => env('BILGE_SECURITY_INGEST_PATH', '/api/ingest/security'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Security posture audit
+    |--------------------------------------------------------------------------
+    |
+    | When enabled (opt-in), the SDK periodically (at most once per interval, throttled via the
+    | cache) reports a security-posture snapshot to POST /api/ingest/security: integrity hashes of
+    | a few high-signal files (.env, composer.lock, public/index.php, artisan), non-secret config
+    | flags (APP_DEBUG, session/cookie security, app URL scheme), files exposed in the public web
+    | root, and a dependency count. No secret values are read — only digests and flags. The Bilge
+    | server diffs each snapshot against the previous one to detect tampering and misconfiguration.
+    |
+    */
+    'security_audit' => [
+        'enabled' => env('BILGE_SECURITY_AUDIT_ENABLED', false),
+        'interval_minutes' => (int) env('BILGE_SECURITY_AUDIT_INTERVAL_MINUTES', 60),
+    ],
+
+    'rum_ingest_path' => env('BILGE_RUM_INGEST_PATH', '/api/ingest/rum'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Browser Real User Monitoring (POST /api/ingest/rum)
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, {@see Bilge\Tracing\Laravel\RumScript} injects bilge-rum.js
+    | into Blade layouts. Requires performance.enabled (same server gate as traces).
+    | Defaults on with BILGE_LARAVEL=true when API key and base URI resolve.
+    |
+    */
+    'rum' => [
+        'enabled' => $laravelQuickStart,
+        'ingest_path' => env('BILGE_RUM_INGEST_PATH', '/api/ingest/rum'),
+        'livewire_navigate' => filter_var(env('BILGE_RUM_LIVEWIRE_NAVIGATE', true), FILTER_VALIDATE_BOOLEAN),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Custom metrics (bilge_metrics — counters, gauges, distributions)
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, samples buffer for POST /api/ingest/metric. Each point can carry the active
+    | trace id for correlation in the Bilge UI. Workers should call flush() on a schedule.
+    |
+    */
+    'metrics' => [
+        'enabled' => $laravelQuickStart,
+        'sample_rate' => (float) env('BILGE_METRICS_SAMPLE_RATE', 1.0),
+        'flush_on_terminate' => (bool) env('BILGE_METRICS_FLUSH_ON_TERMINATE', true),
+        'max_buffer' => (int) env('BILGE_METRICS_MAX_BUFFER', 500),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Queue job monitoring (POST /api/ingest/job)
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, Laravel queue workers report in_progress → ok/error runs to Bilge.
+    | Defaults on with BILGE_LARAVEL=true; requires a resolved API key and base URI.
+    | Respect project job_ingest_enabled on the server (403 when off).
+    |
+    */
+    'job_monitoring' => [
+        'enabled' => $laravelQuickStart,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Queue batch monitoring (POST /api/ingest/batch)
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, Laravel reports Bus batch lifecycle (BatchDispatched, BatchFinished, BatchCanceled)
+    | to Bilge (Telescope Batch Watcher). Defaults on with BILGE_LARAVEL=true; requires a resolved
+    | API key and base URI. Respect project batch_ingest_enabled on the server (403 when off).
+    |
+    */
+    'batch_monitoring' => [
+        'enabled' => $laravelQuickStart,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Authentication monitoring (POST /api/ingest/auth)
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, Laravel reports authentication lifecycle events (Login, Logout, Failed, Lockout,
+    | Registered, PasswordReset, Verified) to Bilge. Only the user id and a display label
+    | (email/name) are sent — never credentials or passwords. Opt-in; off by default. Respect project
+    | auth_ingest_enabled on the server (403 when off).
+    |
+    */
+    'auth_monitoring' => [
+        'enabled' => (bool) env('BILGE_AUTH_MONITORING_ENABLED', false),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Filesystem monitoring (file.read / file.write / file.delete spans)
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, Laravel disks are wrapped so read/write/delete operations surface as child spans
+    | inside performance traces. Laravel filesystems fire no native events, so this replaces resolved
+    | disks app-wide — opt-in, off by default. Only path + disk + byte size are recorded, never file
+    | contents. An empty 'disks' list traces the default disk; otherwise the listed disks are wrapped.
+    |
+    */
+    'filesystem_monitoring' => [
+        'enabled' => (bool) env('BILGE_FILESYSTEM_MONITORING_ENABLED', false),
+        'disks' => [],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Mail monitoring (POST /api/ingest/mail)
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, Laravel reports MessageSent events to Bilge (Telescope Mail Watcher).
+    | Defaults on with BILGE_LARAVEL=true. Respect project mail_ingest_enabled on the server.
+    |
+    */
+    'mail_monitoring' => [
+        'enabled' => $laravelQuickStart,
+        'sample_rate' => (float) env('BILGE_MAIL_MONITORING_SAMPLE_RATE', 1.0),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Domain event monitoring (POST /api/ingest/event)
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, dispatches are buffered and flushed at end of request (or manually).
+    | Use allowlist for specific event classes, or wildcard=true with ignore_prefixes.
+    | Defaults on with BILGE_LARAVEL=true. Respect project event_ingest_enabled on the server.
+    |
+    */
+    'event_monitoring' => [
+        'enabled' => $laravelQuickStart,
+        'wildcard' => (bool) env('BILGE_EVENT_MONITORING_WILDCARD', false),
+        'allowlist' => [],
+        'ignore_prefixes' => ['Illuminate\\', 'Laravel\\', 'Livewire\\'],
+        'wildcard_sample_every' => max(1, (int) env('BILGE_EVENT_MONITORING_SAMPLE_EVERY', 1)),
+        'flush_on_terminate' => (bool) env('BILGE_EVENT_MONITORING_FLUSH_ON_TERMINATE', true),
+        'max_buffer' => (int) env('BILGE_EVENT_MONITORING_MAX_BUFFER', 100),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Notification monitoring (POST /api/ingest/notification)
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, Laravel reports NotificationSent events to Bilge.
+    | Defaults on with BILGE_LARAVEL=true. Respect project notification_ingest_enabled on the server.
+    |
+    */
+    'notification_monitoring' => [
+        'enabled' => $laravelQuickStart,
+        'sample_rate' => (float) env('BILGE_NOTIFICATION_MONITORING_SAMPLE_RATE', 1.0),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Cron / schedule check-ins (POST /api/ingest/cron)
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, {@see Bilge\Tracing\Cron\Client} sends monitor check-ins.
+    | Defaults on with BILGE_LARAVEL=true. No server-side project gate (always accepted when keyed).
+    |
+    | 'auto_schedule' hooks Laravel's scheduler so every scheduled task auto-reports in_progress
+    | on start and ok/error on finish (with its cron expression) — no per-task wrapping needed.
+    | 'checkin_margin' is the grace period (minutes) sent when a monitor is first created.
+    |
+    */
+    'cron_monitoring' => [
+        'enabled' => $laravelQuickStart,
+        'auto_schedule' => filter_var((string) env('BILGE_CRON_AUTO_SCHEDULE', $laravelQuickStart ? 'true' : 'false'), FILTER_VALIDATE_BOOLEAN),
+        'checkin_margin' => (int) env('BILGE_CRON_CHECKIN_MARGIN', 5),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Eloquent model monitoring (POST /api/ingest/model)
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, Laravel buffers eloquent created/updated/deleted events for App\ models
+    | (configurable). Only attribute names are sent on update — never values.
+    | Defaults on with BILGE_LARAVEL=true. Respect project model_ingest_enabled on the server.
+    |
+    */
+    'model_monitoring' => [
+        'enabled' => $laravelQuickStart,
+        'sample_rate' => (float) env('BILGE_MODEL_MONITORING_SAMPLE_RATE', 1.0),
+        'namespace_prefix' => env('BILGE_MODEL_MONITORING_NAMESPACE', 'App\\'),
+        'allowlist' => [],
+        'ignore_prefixes' => ['Illuminate\\', 'Laravel\\', 'Livewire\\'],
+        'ignore_change_attributes' => ['updated_at', 'created_at'],
+        'flush_on_terminate' => (bool) env('BILGE_MODEL_MONITORING_FLUSH_ON_TERMINATE', true),
+        'max_buffer' => (int) env('BILGE_MODEL_MONITORING_MAX_BUFFER', 200),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Authorization gate monitoring (POST /api/ingest/gate)
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, Laravel buffers authorization gate/policy evaluations (GateEvaluated):
+    | ability, allow/deny result, the target type, and the acting user id only (no names/values).
+    | Defaults on with BILGE_LARAVEL=true. Respects project gate_ingest_enabled on the server.
+    |
+    | Gate checks fire on nearly every request and are high volume; sample_rate randomly keeps
+    | that fraction of evaluations client-side (1.0 = keep all, 0.01 = keep ~1%, 0.0 = keep none).
+    |
+    */
+    'gate_monitoring' => [
+        'enabled' => $laravelQuickStart,
+        'sample_rate' => (float) env('BILGE_GATE_MONITORING_SAMPLE_RATE', 1.0),
+        'allowlist' => [],
+        'ignore_abilities' => [],
+        'flush_on_terminate' => (bool) env('BILGE_GATE_MONITORING_FLUSH_ON_TERMINATE', true),
+        'max_buffer' => (int) env('BILGE_GATE_MONITORING_MAX_BUFFER', 200),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Trace ingest HTTP (retries)
+    |--------------------------------------------------------------------------
+    |
+    | On 429 or connection failures, Tracer::flushWithResult() may retry before giving up.
+    | Status list is comma-separated HTTP codes (default: 429 only). 403 is never retried.
+    |
+    */
+    'trace_ingest' => [
+        'max_attempts' => (int) env('BILGE_TRACE_INGEST_MAX_ATTEMPTS', 1),
+        'retry_delay_ms' => (int) env('BILGE_TRACE_INGEST_RETRY_DELAY_MS', 250),
+        'retry_statuses' => array_values(array_filter(array_map(
+            static fn (string $s): int => (int) trim($s),
+            explode(',', (string) env('BILGE_TRACE_INGEST_RETRY_STATUSES', '429'))
+        ), static fn (int $c): bool => $c > 0)),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Error ingest (uncaught exceptions)
+    |--------------------------------------------------------------------------
+    |
+    | When true, registers a reportable handler that POSTs to error_ingest_path with breadcrumbs
+    | and trace fields. Enable explicitly in each environment (see BILGE_REPORT_EXCEPTIONS).
+    |
+    */
+    'report_exceptions' => $reportExceptions,
+
+    /*
+    |--------------------------------------------------------------------------
+    | Debug page ("Bilge's Ignition")
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, genuine server errors on full-page HTML requests render an
+    | interactive, on-box debug page (stack + locally-resolved source + context
+    | + breadcrumbs) INSTEAD of the app's error page — but only for viewers the
+    | host authorizes via Bilge::showDebugPageUsing(). This is independent of
+    | APP_DEBUG: production stays in production mode for everyone else. With no
+    | gate registered it defaults to APP_DEBUG (the normal local experience).
+    |
+    */
+    'debug_page' => [
+        'enabled' => filter_var((string) env('BILGE_DEBUG_PAGE', env('APP_DEBUG', false)), FILTER_VALIDATE_BOOLEAN),
+
+        /*
+        | Editor used for "open file:line" deep links on stack frames. One of:
+        | vscode, vscode-insiders, cursor, windsurf, phpstorm, idea, sublime,
+        | zed, textmate, nova, emacs, macvim. Empty disables the links.
+        */
+        'editor' => env('BILGE_DEBUG_PAGE_EDITOR', 'vscode'),
+
+        /*
+        | Path mapping for Sail/Docker: when the app runs in a container the
+        | recorded file paths (remote_sites_path, e.g. /var/www/html) are
+        | rewritten to the host checkout (local_sites_path) before building
+        | editor links.
+        */
+        'remote_sites_path' => env('BILGE_REMOTE_SITES_PATH', ''),
+        'local_sites_path' => env('BILGE_LOCAL_SITES_PATH', ''),
+
+        /*
+        | "Seen N times before" banner: a single short-timeout (~0.5s), fail-open
+        | GET to the Bilge dashboard at render time. The only network call the
+        | debug page makes; set false to render fully offline.
+        */
+        'remote_stats' => filter_var((string) env('BILGE_DEBUG_PAGE_REMOTE_STATS', true), FILTER_VALIDATE_BOOLEAN),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | HTTP 404 reporting
+    |--------------------------------------------------------------------------
+    |
+    | When true (and report_exceptions is enabled), completed HTTP responses with status 404
+    | are sent to Bilge as handled warning events. Laravel normally skips NotFoundHttpException
+    | in the exception reporter, so this listens on RequestHandled instead.
+    |
+    */
+    'report_http_404' => filter_var(env('BILGE_REPORT_HTTP_404', true), FILTER_VALIDATE_BOOLEAN),
+
+    'error_ingest_path' => env('BILGE_ERROR_INGEST_PATH', '/api/ingest'),
+
+    'environment' => env('APP_ENV'),
+
+    'release' => env('BILGE_RELEASE'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Deployment markers (traces, errors, profiles)
+    |--------------------------------------------------------------------------
+    |
+    | Optional git SHA and deploy/build time sent with performance traces and error reports so
+    | regressions line up with POST /api/ingest/deploy rows. When empty, common platform variables
+    | are used (SOURCE_VERSION, GITHUB_SHA, RENDER_GIT_COMMIT, VERCEL_GIT_COMMIT_SHA, …).
+    |
+    */
+    'commit_sha' => env('BILGE_COMMIT_SHA'),
+
+    'deployed_at' => env('BILGE_DEPLOYED_AT'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Framework breadcrumbs (HTTP, Artisan, queue, optional DB / log / events)
+    |--------------------------------------------------------------------------
+    |
+    | Breadcrumbs are attached to the next error report. They reset at each route match, Artisan
+    | command, or queue job so long-lived PHP workers (Octane, queue:work) do not leak context.
+    |
+    */
+    'breadcrumbs_max' => (int) env('BILGE_BREADCRUMBS_MAX', 50),
+
+    'instrumentation' => [
+        'enabled' => env('BILGE_INSTRUMENTATION_ENABLED', true),
+
+        /*
+         * When true, enables optional breadcrumb + performance collectors (cache, Redis, views,
+         * outbound HTTP, response detail, SQL sample breadcrumbs, DB transaction breadcrumbs) and
+         * turns on performance collectors for cache, Redis, views, and log spans. Requires
+         * performance.enabled for trace collectors.
+         */
+        'comprehensive_collection' => env('BILGE_INSTRUMENT_COMPREHENSIVE_COLLECTION', false),
+
+        'http' => env('BILGE_INSTRUMENT_HTTP', true),
+        'console' => env('BILGE_INSTRUMENT_CONSOLE', true),
+        'queue' => env('BILGE_INSTRUMENT_QUEUE', true),
+
+        /*
+         * SQL breadcrumbs (can be noisy). database_sample_every: 1 = every query, 5 = every 5th.
+         * Enabled by default so error reports include sampled SQL context; set false to disable.
+         */
+        'database' => env('BILGE_INSTRUMENT_DATABASE', true),
+        'database_sample_every' => (int) env('BILGE_INSTRUMENT_DATABASE_SAMPLE_EVERY', 5),
+
+        /*
+         * DB transaction beginning / commit / rollback breadcrumbs (Illuminate database events).
+         */
+        'database_transactions' => env('BILGE_INSTRUMENT_DATABASE_TRANSACTIONS', false),
+
+        /*
+         * Maps MessageLogged to breadcrumbs (very noisy in debug).
+         */
+        'log' => env('BILGE_INSTRUMENT_LOG', false),
+
+        /*
+         * List of application event class names to record (e.g. App\Events\OrderShipped::class).
+         */
+        'application_event_allowlist' => array_values(array_filter(array_map(
+            'trim',
+            explode(',', (string) env('BILGE_INSTRUMENT_EVENT_ALLOWLIST', ''))
+        ))),
+
+        /*
+         * Record every non-framework event name (heavy). Ignores namespaces in application_event_ignore_prefixes.
+         */
+        'application_events_wildcard' => env('BILGE_INSTRUMENT_EVENTS_WILDCARD', false),
+
+        'application_event_ignore_prefixes' => ['Illuminate\\', 'Laravel\\', 'Livewire\\'],
+
+        /*
+         * Optional breadcrumb recorders. Requires instrumentation.enabled.
+         */
+        'cache' => env('BILGE_INSTRUMENT_CACHE', true),
+        'redis' => env('BILGE_INSTRUMENT_REDIS', false),
+        'views' => env('BILGE_INSTRUMENT_VIEWS', false),
+        'outbound_http' => env('BILGE_INSTRUMENT_OUTBOUND_HTTP', false),
+        'response_detail' => env('BILGE_INSTRUMENT_RESPONSE_DETAIL', false),
+        'dump' => env('BILGE_INSTRUMENT_DUMP', false),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Error report client (middleware, truncation, sampling, queued send)
+    |--------------------------------------------------------------------------
+    |
+    | Enrich payload, trim to API limits, optional shutdown flush. Defaults preserve
+    | immediate POST behavior unless you enable queuing.
+    |
+    */
+    'reporting' => [
+        'disabled' => env('BILGE_REPORTING_DISABLED', false),
+
+        /*
+         * When true, payloads are buffered and sent on shutdown (see also send_immediately).
+         */
+        'queue' => env('BILGE_REPORT_QUEUE', false),
+
+        /*
+         * When true, each report is POSTed immediately (queue is skipped).
+         */
+        'send_immediately' => env('BILGE_REPORT_SEND_IMMEDIATELY', true),
+
+        /*
+         * When true with queue enabled, Laravel flushes buffered errors on $app->terminating()
+         * instead of PHP shutdown.
+         */
+        'flush_on_terminate' => (bool) env('BILGE_REPORT_FLUSH_ON_TERMINATE', false),
+
+        /*
+         * Random client-side drop rate for uncaught reports (0.0–1.0). 1.0 = keep all.
+         */
+        'sample_rate' => (float) env('BILGE_REPORT_SAMPLE_RATE', 1.0),
+
+        /*
+         * Client suppression keys for errors ignored on the dashboard. Populated at boot from the
+         * remote /api/config `suppress` list; matching exceptions are dropped before send. Leave empty.
+         */
+        'suppressed_keys' => [],
+
+        /*
+         * Optional list of ReportMiddlewareInterface class names (container-resolved).
+         * Empty = default stack (application + request + git + attributes + solutions).
+         */
+        'middleware' => [],
+
+        /*
+         * AttributeProviderInterface class names; merged into context.attributes.
+         */
+        'attribute_providers' => [],
+
+        /*
+         * First matching string becomes the ingest "solution" field when empty.
+         */
+        'client_solutions' => [],
+
+        /*
+         * Include normalized function arguments on structured stack_frames when PHP provides them.
+         * PHP may omit args when zend.exception_ignore_args=1 (default in some builds).
+         *
+         * Note: arguments can carry credentials passed by value (e.g. Auth::attempt(['password' => …]),
+         * DB connect strings). They are run through DataRedactor when included, but for
+         * secret-sensitive apps prefer BILGE_REPORT_STACK_ARGUMENTS=false.
+         */
+        'include_stack_arguments' => env('BILGE_REPORT_STACK_ARGUMENTS', true),
+
+        /*
+         * Secret redaction policy for breadcrumbs, span data, context, and stack-frame
+         * arguments. `extra_keys` add exact key names; `patterns` add case-insensitive
+         * substrings (matched anywhere in a key — e.g. "secret" catches "client_secret").
+         * `scrub_sql` masks string/long-numeric literals in query breadcrumbs.
+         */
+        'redaction' => [
+            'extra_keys' => array_filter(array_map('trim', explode(',', (string) env('BILGE_REDACT_KEYS', '')))),
+            'patterns' => array_filter(array_map('trim', explode(',', (string) env('BILGE_REDACT_PATTERNS', '')))),
+            'scrub_sql' => (bool) env('BILGE_REDACT_SQL', true),
+        ],
+
+        'truncation' => [
+            'max_message_length' => (int) env('BILGE_REPORT_MAX_MESSAGE', 131_072),
+            'max_stack_trace_bytes' => (int) env('BILGE_REPORT_MAX_STACK', 524_288),
+            'max_stack_frames' => (int) env('BILGE_REPORT_MAX_FRAMES', 200),
+            'max_stack_frame_args_json' => (int) env('BILGE_REPORT_MAX_STACK_ARGS_JSON', 4096),
+            'max_breadcrumbs' => (int) env('BILGE_REPORT_MAX_BREADCRUMBS', 50),
+            'max_breadcrumb_message' => (int) env('BILGE_REPORT_MAX_CRUMB_MSG', 2000),
+            'max_breadcrumb_data_json' => (int) env('BILGE_REPORT_MAX_CRUMB_DATA', 8192),
+            'max_context_json' => (int) env('BILGE_REPORT_MAX_CONTEXT', 262_144),
+        ],
+
+        /*
+         * When enabled, error reports may include grouping_slow_path + grouping_db_time_ms so the server
+         * fingerprints slow / DB-heavy occurrences separately (route + DB time bucket overlay).
+         * Requires BILGE_PERFORMANCE_ENABLED and recorded spans in the same request.
+         */
+        'performance_grouping' => [
+            'enabled' => env('BILGE_REPORT_PERFORMANCE_GROUPING', false),
+            'slow_root_transaction_ms' => (int) env('BILGE_REPORT_GROUPING_ROOT_SLOW_MS', 2000),
+            'slow_db_total_ms' => (int) env('BILGE_REPORT_GROUPING_DB_TOTAL_MS', 200),
+        ],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Auto flush on HTTP terminate
+    |--------------------------------------------------------------------------
+    */
+    'auto_flush' => $tracingAutoFlush,
+
+    /*
+    |--------------------------------------------------------------------------
+    | Performance monitoring (distributed traces / spans)
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, the tracer records spans (HTTP server transaction, DB, outbound
+    | HTTP via Guzzle middleware, Artisan, queue, log events) and can POST them with
+    | Tracer::flush() / BILGE_TRACING_AUTO_FLUSH.
+    |
+    | Bilge can reject trace ingest per project (Project settings → Monitoring modes).
+    | The API returns HTTP 403 with a JSON message. Use Tracer::flushWithResult() if you
+    | want to log that case, and keep BILGE_PERFORMANCE_ENABLED in sync (e.g. from
+    | GET /api/v1/projects → performance_ingest_enabled during deploy).
+    |
+    | Register middleware aliases in order: bilgeTracing.continueTrace, then
+    | bilgeTracing.performance. Optional: performance.middleware_auto_register only
+    | appends performance to the web and api groups (add continueTrace yourself if missing).
+    |
+    */
+    'performance' => [
+        'enabled' => $laravelQuickStart,
+
+        /*
+         * When true, log a warning if trace flush returns HTTP 403 (project disabled performance ingest).
+         */
+        'log_forbidden_trace_ingest' => env('BILGE_LOG_FORBIDDEN_TRACE_INGEST', true),
+
+        'middleware_auto_register' => MonitoringEnv::resolveEnabled(env('BILGE_PERFORMANCE_AUTO_MIDDLEWARE'), $laravelQuickStart),
+
+        /*
+         * Flush trace to Bilge after each Artisan command or queue job (in addition to HTTP auto_flush).
+         */
+        'flush_after_cli_and_queue' => env('BILGE_PERFORMANCE_FLUSH_CLI_QUEUE', false),
+
+        /*
+         * Queue: merge traceparent + baggage into each payload so workers continue the same trace_id.
+         * When queue_publish_span is true, a short queue.publish child is recorded under the current span and
+         * the worker’s queue.process transaction parents to that span (sync + async).
+         */
+        'queue_propagate_trace' => env('BILGE_PERFORMANCE_QUEUE_PROPAGATE_TRACE', true),
+        'queue_publish_span' => env('BILGE_PERFORMANCE_QUEUE_PUBLISH_SPAN', true),
+
+        'trace_limits' => [
+            'max_spans' => (int) env('BILGE_PERFORMANCE_MAX_SPANS', 512),
+            'max_attributes_per_span' => (int) env('BILGE_PERFORMANCE_MAX_ATTRIBUTES_PER_SPAN', 128),
+            'max_span_events_per_span' => (int) env('BILGE_PERFORMANCE_MAX_SPAN_EVENTS_PER_SPAN', 128),
+            'max_attributes_per_span_event' => (int) env('BILGE_PERFORMANCE_MAX_ATTRIBUTES_PER_SPAN_EVENT', 128),
+        ],
+
+        /*
+         * Sampler for brand-new traces (no incoming traceparent header). Incoming traces with sampled=0 never record.
+         */
+        'sampler' => [
+            'class' => env('BILGE_PERFORMANCE_SAMPLER', RateSampler::class),
+            'config' => [
+                'rate' => (float) env('BILGE_PERFORMANCE_SAMPLE_RATE', 0.1),
+            ],
+        ],
+
+        /*
+         * Tail sampling: record spans locally for every trace (when performance is on), then drop the batch at
+         * flush unless it is “interesting” or tied to an error report / upstream sample / distributed child.
+         * Head sampler still sets the traceparent propagation hint (defaultSampled) when tail sampling is on.
+         *
+         * BILGE_PERFORMANCE_TAIL_SAMPLING: enable tail policy at export time.
+         * BILGE_PERFORMANCE_TAIL_SLOW_MS: root duration threshold (ms) for always_export_slow.
+         * BILGE_PERFORMANCE_TAIL_RESIDUAL_RATE: random keep fraction for otherwise boring traces (0 = off).
+         */
+        'tail_sampling' => [
+            'enabled' => env('BILGE_PERFORMANCE_TAIL_SAMPLING', false),
+            'slow_transaction_ms' => (int) env('BILGE_PERFORMANCE_TAIL_SLOW_MS', 2000),
+            'always_export_slow' => env('BILGE_PERFORMANCE_TAIL_ALWAYS_SLOW', true),
+            'http_error_status_from' => (int) env('BILGE_PERFORMANCE_TAIL_HTTP_ERROR_FROM', 500),
+            'export_on_span_internal_error' => env('BILGE_PERFORMANCE_TAIL_EXPORT_ON_SPAN_ERROR', true),
+            'residual_rate' => (float) env('BILGE_PERFORMANCE_TAIL_RESIDUAL_RATE', 0.0),
+            'keep_distributed_participation' => env('BILGE_PERFORMANCE_TAIL_KEEP_DISTRIBUTED', true),
+        ],
+
+        /*
+         * cache: Laravel cache repository (Redis, Memcached, file, etc.) — hit/miss/set/forget spans, many()
+         *   / putMany() batch spans, duration_ms, optional TTL, tag counts; root rollup: hit/miss/set/forget
+         *   counts, hit_ratio, batch call counts.
+         * redis: raw Redis commands via Laravel — duration, blocking commands (BLPOP, XREAD … BLOCK, …),
+         *   blocking_duration_ms, SET NX → cache.lock_attempt.
+         * http_client: Guzzle middleware + Laravel Http:: spans (RequestSending / ResponseReceived) + server.address.
+         *
+         * db.query_count is always set on the transaction root when the database collector is on (including 0).
+         * db.total_duration_ms and db.slow_query_count summarize all queries in the transaction (not just sampled spans).
+         * repeat_query_max / suspected_n_plus_one require query_insights.enabled and at least one query.
+         * php.memory_* uses memory_reset_peak_usage() per HTTP request, queue job, Artisan command, and Octane
+         * RequestReceived so peaks reflect the current unit of work in long-lived workers.
+         */
+        'slow_query_ms' => (float) env('BILGE_PERFORMANCE_SLOW_QUERY_MS', 100),
+
+        'collectors' => [
+            'http_server' => env('BILGE_PERFORMANCE_COLLECT_HTTP', true),
+            'database' => env('BILGE_PERFORMANCE_COLLECT_DB', true),
+            'http_client' => env('BILGE_PERFORMANCE_COLLECT_HTTP_CLIENT', true),
+            'cache' => env('BILGE_PERFORMANCE_COLLECT_CACHE', true),
+            'redis' => env('BILGE_PERFORMANCE_COLLECT_REDIS', false),
+            'console' => env('BILGE_PERFORMANCE_COLLECT_CONSOLE', true),
+            'queue' => env('BILGE_PERFORMANCE_COLLECT_QUEUE', true),
+            'log' => env('BILGE_PERFORMANCE_COLLECT_LOG', false),
+            'view' => env('BILGE_PERFORMANCE_COLLECT_VIEW', false),
+        ],
+
+        /*
+         * Incoming requests whose route matches any pattern here never start an http.server
+         * transaction. Patterns match the route name, route URI, or request path
+         * (case-insensitive, `*` wildcards): 'horizon.*', '/health*', 'api/status'.
+         * Env form is comma-separated: BILGE_PERFORMANCE_IGNORE_ROUTES="horizon.*,/up".
+         * The dashboard's ignored-request-routes (remote config `ignore_routes`) are merged
+         * in at boot, so routes can also be ignored from the Bilge UI without a deploy.
+         */
+        'ignore_routes' => env('BILGE_PERFORMANCE_IGNORE_ROUTES', []),
+
+        /*
+         * View collector (collectors.view): records one zero-duration view.render span per
+         * composing view. High volume — capped per request, and namespaced vendor views
+         * (containing "::") are skipped. Add substrings to view_deny to exclude more by name.
+         *
+         * view_data (opt-in, default off): also capture the actual variable VALUES passed to each
+         * view, serialized into a normalized, redacted tree (same engine as dumps — depth/child/
+         * string/byte caps, cycle detection, secret redaction by key). Off by default because values
+         * can carry PII and inflate trace size; the collector otherwise records variable names only.
+         * Keep the serializer caps tight — this runs on every view render.
+         */
+        'view_max_per_request' => (int) env('BILGE_PERFORMANCE_VIEW_MAX_PER_REQUEST', 50),
+        'view_deny' => array_values(array_filter(array_map('trim', explode(',', (string) env('BILGE_PERFORMANCE_VIEW_DENY', ''))))),
+        'view_data' => filter_var(env('BILGE_PERFORMANCE_COLLECT_VIEW_DATA', false), FILTER_VALIDATE_BOOLEAN),
+        'view_data_serializer' => [
+            'max_depth' => (int) env('BILGE_PERFORMANCE_VIEW_DATA_MAX_DEPTH', 4),
+            'max_children' => (int) env('BILGE_PERFORMANCE_VIEW_DATA_MAX_CHILDREN', 50),
+            'max_string' => (int) env('BILGE_PERFORMANCE_VIEW_DATA_MAX_STRING', 2048),
+            'max_total_bytes' => (int) env('BILGE_PERFORMANCE_VIEW_DATA_MAX_TOTAL_BYTES', 16384),
+        ],
+
+        /*
+         * view_source (opt-in, default off): also capture a capped excerpt of the template's own
+         * source (view.source) so the UI can show what the view looks like. The read is cached per
+         * path within a request. Off by default — it touches the filesystem on render.
+         */
+        'view_source' => filter_var(env('BILGE_PERFORMANCE_COLLECT_VIEW_SOURCE', false), FILTER_VALIDATE_BOOLEAN),
+        'view_source_max_lines' => (int) env('BILGE_PERFORMANCE_VIEW_SOURCE_MAX_LINES', 60),
+        'view_source_max_bytes' => (int) env('BILGE_PERFORMANCE_VIEW_SOURCE_MAX_BYTES', 8192),
+
+        'database_sample_every' => (int) env('BILGE_PERFORMANCE_DB_SAMPLE_EVERY', 1),
+
+        'query_insights' => [
+            'enabled' => env('BILGE_PERFORMANCE_QUERY_INSIGHTS', true),
+            'n_plus_one_min_repeat' => (int) env('BILGE_PERFORMANCE_N_PLUS_ONE_MIN_REPEAT', 4),
+            'n_plus_one_min_queries' => (int) env('BILGE_PERFORMANCE_N_PLUS_ONE_MIN_QUERIES', 8),
+        ],
+
+        /*
+         * Extra request/response attributes attached to the http.server root span. PII-bearing
+         * fields (client_ip, user_id) are opt-in. query_string is truncated to 512 chars; when
+         * a route is matched, http.route is recorded for stable per-endpoint grouping. Outbound
+         * call rollups (http.client.count / http.client.time_ms) follow the http_client collector.
+         */
+        'request_metadata' => [
+            'query_string' => env('BILGE_PERFORMANCE_CAPTURE_QUERY_STRING', true),
+            'user_agent' => env('BILGE_PERFORMANCE_CAPTURE_USER_AGENT', true),
+            'response_size' => env('BILGE_PERFORMANCE_CAPTURE_RESPONSE_SIZE', true),
+            'client_ip' => env('BILGE_PERFORMANCE_CAPTURE_CLIENT_IP', false),
+            'user_id' => env('BILGE_PERFORMANCE_CAPTURE_USER_ID', false),
+
+            /*
+             * Authenticated user display name / email (opt-in, PII). When on, the http.server
+             * root span carries http.user_name / http.user_email read from the auth user model
+             * (name/display_name/username, then email), each truncated to 256 chars. Off by
+             * default — only enable where surfacing who made a request is acceptable.
+             */
+            'user_name' => env('BILGE_PERFORMANCE_CAPTURE_USER_NAME', false),
+            'user_email' => env('BILGE_PERFORMANCE_CAPTURE_USER_EMAIL', false),
+
+            /*
+             * Low-risk request shape, on by default: HTTP method, request/response content
+             * types, and route-model-bound parameters (object params reduced to their route
+             * key — never the model). All run through DataRedactor by key name.
+             */
+            'http_method' => env('BILGE_PERFORMANCE_CAPTURE_HTTP_METHOD', true),
+            'content_type' => env('BILGE_PERFORMANCE_CAPTURE_CONTENT_TYPE', true),
+            'route_params' => env('BILGE_PERFORMANCE_CAPTURE_ROUTE_PARAMS', true),
+
+            /*
+             * PII-bearing payloads, opt-in. Header names and structured (JSON/form) body keys
+             * are redacted by DataRedactor (authorization, cookie, token, password, …); bodies
+             * are truncated to body_max_bytes. Response bodies are captured for textual/JSON
+             * content types only.
+             */
+            'request_headers' => env('BILGE_PERFORMANCE_CAPTURE_REQUEST_HEADERS', false),
+            'response_headers' => env('BILGE_PERFORMANCE_CAPTURE_RESPONSE_HEADERS', false),
+            'request_body' => env('BILGE_PERFORMANCE_CAPTURE_REQUEST_BODY', false),
+            'response_body' => env('BILGE_PERFORMANCE_CAPTURE_RESPONSE_BODY', false),
+            'body_max_bytes' => (int) env('BILGE_PERFORMANCE_CAPTURE_BODY_MAX_BYTES', 8192),
+        ],
+    ],
+];

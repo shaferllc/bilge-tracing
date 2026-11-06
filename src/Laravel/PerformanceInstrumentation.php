@@ -1,0 +1,1946 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Bilge\Tracing\Laravel;
+
+use Illuminate\Cache\Events\CacheEvent;
+use Illuminate\Cache\Events\CacheHit;
+use Illuminate\Cache\Events\CacheMissed;
+use Illuminate\Cache\Events\ForgettingKey;
+use Illuminate\Cache\Events\KeyForgetFailed;
+use Illuminate\Cache\Events\KeyForgotten;
+use Illuminate\Cache\Events\KeyWriteFailed;
+use Illuminate\Cache\Events\KeyWritten;
+use Illuminate\Cache\Events\RetrievingKey;
+use Illuminate\Cache\Events\RetrievingManyKeys;
+use Illuminate\Cache\Events\WritingKey;
+use Illuminate\Cache\Events\WritingManyKeys;
+use Illuminate\Console\Events\CommandFinished;
+use Illuminate\Console\Events\CommandStarting;
+use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Contracts\Foundation\Application;
+use Illuminate\Contracts\Queue\Job as QueueJobContract;
+use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Foundation\Http\Events\RequestHandled;
+use Illuminate\Http\Client\Events\ConnectionFailed;
+use Illuminate\Http\Client\Events\RequestSending;
+use Illuminate\Http\Client\Events\ResponseReceived;
+use Illuminate\Http\Client\Request as HttpClientRequest;
+use Illuminate\Http\Request;
+use Illuminate\Log\Events\MessageLogged;
+use Illuminate\Queue\Events\JobAttempted;
+use Illuminate\Queue\Events\JobProcessing;
+use Illuminate\Redis\Events\CommandExecuted;
+use Illuminate\Routing\Route;
+use Illuminate\Support\Facades\Redis;
+use Illuminate\View\Factory as ViewFactory;
+use Illuminate\View\View;
+use Bilge\Tracing\Dump\DumpSerializer;
+use Bilge\Tracing\Profiling\AutoProfiler;
+use Bilge\Tracing\Span;
+use Bilge\Tracing\SpanOperation;
+use Bilge\Tracing\Support\DataRedactor;
+use Bilge\Tracing\Support\IngestSelfMonitoring;
+use Bilge\Tracing\Support\MemoryPeakReset;
+use Bilge\Tracing\Support\SqlFingerprint;
+use Bilge\Tracing\TracePropagationHeader;
+use Bilge\Tracing\Tracer;
+use Bilge\Tracing\TraceWireHeaders;
+use Symfony\Component\HttpFoundation\Response as SymfonyResponse;
+use Throwable;
+use WeakMap;
+
+/**
+ * Span collectors on top of Laravel events (queries, logs, HTTP terminate, Artisan, queue).
+ */
+final class PerformanceInstrumentation
+{
+    private static int $querySeq = 0;
+
+    private static int $queryTotalCount = 0;
+
+    private static float $queryTotalDurationMs = 0.0;
+
+    private static int $slowQueryCount = 0;
+
+    /** @var array<string, int> */
+    private static array $sqlFingerprintCounts = [];
+
+    /**
+     * First-seen, truncated SQL keyed by fingerprint — the sample we attach to the root span so the
+     * server can render the offending statement for a suspected N+1.
+     *
+     * @var array<string, string>
+     */
+    private static array $sqlFingerprintSample = [];
+
+    /**
+     * Call frames captured the first time each fingerprint was seen. Captured once per fingerprint
+     * (not per execution) so a hot loop of repeated queries stays cheap.
+     *
+     * @var array<string, list<array{function: string, call: string, class?: string, file: string, line: int}>>
+     */
+    private static array $sqlFingerprintFrames = [];
+
+    private static float $slowestQueryTimeMs = 0.0;
+
+    private static string $slowestQuerySql = '';
+
+    /** @var list<array{function: string, call: string, class?: string, file: string, line: int}> */
+    private static array $slowestQueryFrames = [];
+
+    /** @var list<float> */
+    private static array $cacheGetStartStack = [];
+
+    /** @var list<float> */
+    private static array $cacheWriteStartStack = [];
+
+    /** @var list<float> */
+    private static array $cacheForgetStartStack = [];
+
+    /** @var WeakMap<HttpClientRequest, Span>|null */
+    private static ?WeakMap $httpClientSpans = null;
+
+    /**
+     * @var list<array{start: float, store: string, total: int, hits: int, misses: int, completed: int}>
+     */
+    private static array $cacheManyGetPending = [];
+
+    /**
+     * @var list<array{start: float, store: string, total: int, outcomes: int, failures: int}>
+     */
+    private static array $cachePutManyPending = [];
+
+    private static int $cacheInsightHits = 0;
+
+    private static int $cacheInsightMisses = 0;
+
+    private static int $cacheInsightSets = 0;
+
+    private static int $cacheInsightForgets = 0;
+
+    private static int $cacheLockAttemptCount = 0;
+
+    private static int $cacheManyGetBatches = 0;
+
+    private static int $cacheManyPutBatches = 0;
+
+    private static int $httpClientCount = 0;
+
+    private static int $viewSpanCount = 0;
+
+    private static int $viewOverflowCount = 0;
+
+    /**
+     * View data keys that are framework plumbing, not application inputs — hidden from data_keys
+     * and the captured value tree so "variables passed to the view" reads meaningfully.
+     *
+     * @var list<string>
+     */
+    private const VIEW_INTERNAL_KEYS = ['__env', 'app', 'errors', 'obLevel', '__laravel_slots'];
+
+    /** @var array<string, array{code: string, truncated: bool}|null> per-request template source cache, keyed by absolute path */
+    private static array $viewSourceCache = [];
+
+    private static float $httpClientDurationMs = 0.0;
+
+    public static function register(Dispatcher $events): void
+    {
+        $perf = config('bilge-tracing.performance');
+        if (! is_array($perf) || empty($perf['enabled'])) {
+            return;
+        }
+
+        $collectors = is_array($perf['collectors'] ?? null) ? $perf['collectors'] : [];
+
+        if (! empty($collectors['http_server'])) {
+            $events->listen(RequestHandled::class, [self::class, 'onRequestHandled']);
+        }
+
+        if (! empty($collectors['console'])) {
+            $events->listen(CommandStarting::class, [self::class, 'onCommandStarting']);
+            $events->listen(CommandFinished::class, [self::class, 'onCommandFinished']);
+        }
+
+        if (! empty($collectors['queue'])) {
+            $events->listen(JobProcessing::class, [self::class, 'onJobProcessing']);
+            $events->listen(JobAttempted::class, [self::class, 'onJobAttempted']);
+        }
+
+        if (! empty($collectors['database'])) {
+            $events->listen(QueryExecuted::class, [self::class, 'onQueryExecuted']);
+        }
+
+        if (! empty($collectors['log'])) {
+            $events->listen(MessageLogged::class, [self::class, 'onMessageLogged']);
+        }
+
+        if (! empty($collectors['cache'])) {
+            self::registerCachePerformance($events);
+        }
+
+        if (! empty($collectors['http_client'])) {
+            self::registerLaravelHttpClientPerformance($events);
+        }
+    }
+
+    /**
+     * Reset per-request DB / cache timing stacks before a new HTTP transaction starts.
+     */
+    public static function resetHttpRequestCounters(): void
+    {
+        self::$querySeq = 0;
+        self::$queryTotalCount = 0;
+        self::$queryTotalDurationMs = 0.0;
+        self::$slowQueryCount = 0;
+        self::$sqlFingerprintCounts = [];
+        self::$sqlFingerprintSample = [];
+        self::$sqlFingerprintFrames = [];
+        self::$slowestQueryTimeMs = 0.0;
+        self::$slowestQuerySql = '';
+        self::$slowestQueryFrames = [];
+        self::$cacheGetStartStack = [];
+        self::$cacheWriteStartStack = [];
+        self::$cacheForgetStartStack = [];
+        self::$cacheManyGetPending = [];
+        self::$cachePutManyPending = [];
+        self::$cacheInsightHits = 0;
+        self::$cacheInsightMisses = 0;
+        self::$cacheInsightSets = 0;
+        self::$cacheInsightForgets = 0;
+        self::$cacheLockAttemptCount = 0;
+        self::$cacheManyGetBatches = 0;
+        self::$cacheManyPutBatches = 0;
+        self::$httpClientCount = 0;
+        self::$httpClientDurationMs = 0.0;
+        self::$viewSpanCount = 0;
+        self::$viewOverflowCount = 0;
+        self::$viewSourceCache = [];
+    }
+
+    public static function registerRedisPerformanceListener(): void
+    {
+        $perf = config('bilge-tracing.performance');
+        if (! is_array($perf) || empty($perf['enabled'])) {
+            return;
+        }
+        $collectors = is_array($perf['collectors'] ?? null) ? $perf['collectors'] : [];
+        if (empty($collectors['redis'])) {
+            return;
+        }
+        if (! class_exists(Redis::class)) {
+            return;
+        }
+        try {
+            Redis::listen(function (CommandExecuted $e): void {
+                if (! self::performanceEnabled() || ! self::collector('redis')) {
+                    return;
+                }
+                $parent = Tracer::instance()->getCurrentSpan();
+                if ($parent === null || $parent->isFinished() || ! Tracer::instance()->isSpanRecordingEnabled()) {
+                    return;
+                }
+
+                $timeMs = (float) $e->time;
+                $now = microtime(true);
+                $start = $now - ($timeMs / 1000.0);
+
+                $desc = self::redisCommandDescription($e);
+                $child = $parent->startChild(SpanOperation::REDIS_COMMAND, $desc, $start);
+                $child->setData(self::redisSpanAttributes($e, $timeMs));
+                $child->finish($now);
+            });
+        } catch (Throwable) {
+            // Redis not configured
+        }
+    }
+
+    private static function registerCachePerformance(Dispatcher $events): void
+    {
+        if (! class_exists(RetrievingKey::class)) {
+            return;
+        }
+
+        $events->listen(RetrievingManyKeys::class, function (RetrievingManyKeys $e): void {
+            if (! self::performanceEnabled() || ! self::collector('cache')) {
+                return;
+            }
+            $keys = is_array($e->keys) ? $e->keys : [];
+            $total = count($keys);
+            if ($total === 0) {
+                return;
+            }
+            self::$cacheManyGetPending[] = [
+                'start' => microtime(true),
+                'store' => (string) ($e->storeName ?? ''),
+                'total' => $total,
+                'hits' => 0,
+                'misses' => 0,
+                'completed' => 0,
+            ];
+        });
+
+        $events->listen(RetrievingKey::class, function (RetrievingKey $e): void {
+            if (! self::performanceEnabled() || ! self::collector('cache')) {
+                return;
+            }
+            self::$cacheGetStartStack[] = microtime(true);
+        });
+
+        $events->listen(CacheHit::class, function (CacheHit $e): void {
+            if (! self::performanceEnabled() || ! self::collector('cache')) {
+                return;
+            }
+            if (self::consumeCacheManyGetHitOrMiss(true)) {
+                return;
+            }
+            self::$cacheInsightHits++;
+            $start = array_pop(self::$cacheGetStartStack);
+            self::finishCacheSpan(
+                SpanOperation::CACHE_GET,
+                'hit '.self::truncateCacheKey((string) $e->key),
+                is_float($start) ? $start : microtime(true),
+                self::cacheSpanDataBase($e, [
+                    'cache.result' => 'hit',
+                ])
+            );
+        });
+
+        $events->listen(CacheMissed::class, function (CacheMissed $e): void {
+            if (! self::performanceEnabled() || ! self::collector('cache')) {
+                return;
+            }
+            if (self::consumeCacheManyGetHitOrMiss(false)) {
+                return;
+            }
+            self::$cacheInsightMisses++;
+            $start = array_pop(self::$cacheGetStartStack);
+            self::finishCacheSpan(
+                SpanOperation::CACHE_GET,
+                'miss '.self::truncateCacheKey((string) $e->key),
+                is_float($start) ? $start : microtime(true),
+                self::cacheSpanDataBase($e, [
+                    'cache.result' => 'miss',
+                ])
+            );
+        });
+
+        $events->listen(WritingManyKeys::class, function (WritingManyKeys $e): void {
+            if (! self::performanceEnabled() || ! self::collector('cache')) {
+                return;
+            }
+            $keys = is_array($e->keys) ? $e->keys : [];
+            $total = count($keys);
+            if ($total === 0) {
+                return;
+            }
+            self::$cachePutManyPending[] = [
+                'start' => microtime(true),
+                'store' => (string) ($e->storeName ?? ''),
+                'total' => $total,
+                'outcomes' => 0,
+                'failures' => 0,
+            ];
+        });
+
+        $events->listen(WritingKey::class, function (WritingKey $e): void {
+            if (! self::performanceEnabled() || ! self::collector('cache')) {
+                return;
+            }
+            self::$cacheWriteStartStack[] = microtime(true);
+        });
+
+        $events->listen(KeyWritten::class, function (KeyWritten $e): void {
+            if (! self::performanceEnabled() || ! self::collector('cache')) {
+                return;
+            }
+            if (self::consumeCachePutManyOutcome(false)) {
+                return;
+            }
+            self::$cacheInsightSets++;
+            $start = array_pop(self::$cacheWriteStartStack);
+            self::finishCacheSpan(
+                SpanOperation::CACHE_SET,
+                'set '.self::truncateCacheKey((string) $e->key),
+                is_float($start) ? $start : microtime(true),
+                self::cacheSpanDataBase($e, [
+                    'cache.result' => 'ok',
+                ])
+            );
+        });
+
+        $events->listen(KeyWriteFailed::class, function (KeyWriteFailed $e): void {
+            if (! self::performanceEnabled() || ! self::collector('cache')) {
+                return;
+            }
+            if (self::consumeCachePutManyOutcome(true)) {
+                return;
+            }
+            self::$cacheInsightSets++;
+            $start = array_pop(self::$cacheWriteStartStack);
+            self::finishCacheSpan(
+                SpanOperation::CACHE_SET,
+                'set failed '.self::truncateCacheKey((string) $e->key),
+                is_float($start) ? $start : microtime(true),
+                self::cacheSpanDataBase($e, []),
+                'internal_error'
+            );
+        });
+
+        $events->listen(ForgettingKey::class, function (ForgettingKey $e): void {
+            if (! self::performanceEnabled() || ! self::collector('cache')) {
+                return;
+            }
+            self::$cacheForgetStartStack[] = microtime(true);
+        });
+
+        $events->listen(KeyForgotten::class, function (KeyForgotten $e): void {
+            if (! self::performanceEnabled() || ! self::collector('cache')) {
+                return;
+            }
+            self::$cacheInsightForgets++;
+            $start = array_pop(self::$cacheForgetStartStack);
+            self::finishCacheSpan(
+                SpanOperation::CACHE_REMOVE,
+                'forget '.self::truncateCacheKey((string) $e->key),
+                is_float($start) ? $start : microtime(true),
+                self::cacheSpanDataBase($e, [
+                    'cache.result' => 'ok',
+                ])
+            );
+        });
+
+        $events->listen(KeyForgetFailed::class, function (KeyForgetFailed $e): void {
+            if (! self::performanceEnabled() || ! self::collector('cache')) {
+                return;
+            }
+            self::$cacheInsightForgets++;
+            $start = array_pop(self::$cacheForgetStartStack);
+            self::finishCacheSpan(
+                SpanOperation::CACHE_REMOVE,
+                'forget failed '.self::truncateCacheKey((string) $e->key),
+                is_float($start) ? $start : microtime(true),
+                self::cacheSpanDataBase($e, []),
+                'internal_error'
+            );
+        });
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     */
+    private static function finishCacheSpan(string $op, string $description, float $start, array $data, ?string $status = null): void
+    {
+        $parent = Tracer::instance()->getCurrentSpan();
+        if ($parent === null || $parent->isFinished() || ! Tracer::instance()->isSpanRecordingEnabled()) {
+            return;
+        }
+        $now = microtime(true);
+        $data['cache.duration_ms'] = max(0.0, round(($now - $start) * 1000, 3));
+        $child = $parent->startChild($op, $description, $start);
+        $child->setData($data);
+        if ($status !== null) {
+            $child->setStatus($status);
+        }
+        $child->finish($now);
+    }
+
+    /**
+     * @param  array{start: float, store: string, total: int, hits: int, misses: int, completed: int}  $batch
+     */
+    private static function finishCacheManyGetBatchSpan(array $batch): void
+    {
+        self::$cacheManyGetBatches++;
+        $desc = 'many get '.$batch['total'].' keys ('.$batch['hits'].' hit, '.$batch['misses'].' miss)';
+        self::finishCacheSpan(
+            SpanOperation::CACHE_GET,
+            $desc,
+            $batch['start'],
+            [
+                'cache.operation' => 'many_get',
+                'cache.batch.keys' => $batch['total'],
+                'cache.batch.hits' => $batch['hits'],
+                'cache.batch.misses' => $batch['misses'],
+                'cache.store' => $batch['store'],
+            ]
+        );
+    }
+
+    /**
+     * @param  array{start: float, store: string, total: int, outcomes: int, failures: int}  $batch
+     */
+    private static function finishCachePutManyBatchSpan(array $batch): void
+    {
+        self::$cacheManyPutBatches++;
+        $desc = 'many set '.$batch['total'].' keys';
+        $status = $batch['failures'] > 0 ? 'internal_error' : null;
+        self::finishCacheSpan(
+            SpanOperation::CACHE_SET,
+            $desc,
+            $batch['start'],
+            [
+                'cache.operation' => 'many_set',
+                'cache.batch.keys' => $batch['total'],
+                'cache.batch.failures' => $batch['failures'],
+                'cache.store' => $batch['store'],
+            ],
+            $status
+        );
+    }
+
+    private static function consumeCacheManyGetHitOrMiss(bool $isHit): bool
+    {
+        if (self::$cacheManyGetPending === []) {
+            return false;
+        }
+        $k = array_key_last(self::$cacheManyGetPending);
+        if ($isHit) {
+            self::$cacheManyGetPending[$k]['hits']++;
+            self::$cacheInsightHits++;
+        } else {
+            self::$cacheManyGetPending[$k]['misses']++;
+            self::$cacheInsightMisses++;
+        }
+        self::$cacheManyGetPending[$k]['completed']++;
+        $completed = self::$cacheManyGetPending[$k]['completed'];
+        $total = self::$cacheManyGetPending[$k]['total'];
+        if ($completed >= $total) {
+            $done = array_pop(self::$cacheManyGetPending);
+            self::finishCacheManyGetBatchSpan($done);
+        }
+
+        return true;
+    }
+
+    private static function consumeCachePutManyOutcome(bool $failed): bool
+    {
+        if (self::$cachePutManyPending === []) {
+            return false;
+        }
+        $k = array_key_last(self::$cachePutManyPending);
+        self::$cachePutManyPending[$k]['outcomes']++;
+        if ($failed) {
+            self::$cachePutManyPending[$k]['failures']++;
+        }
+        self::$cacheInsightSets++;
+        $outcomes = self::$cachePutManyPending[$k]['outcomes'];
+        $total = self::$cachePutManyPending[$k]['total'];
+        if ($outcomes >= $total) {
+            $done = array_pop(self::$cachePutManyPending);
+            self::finishCachePutManyBatchSpan($done);
+        }
+
+        return true;
+    }
+
+    /**
+     * @param  array<string, mixed>  $extra
+     * @return array<string, mixed>
+     */
+    private static function cacheSpanDataBase(CacheEvent $e, array $extra): array
+    {
+        $data = array_merge([
+            'cache.key' => self::truncateCacheKey((string) $e->key),
+            'cache.store' => (string) ($e->storeName ?? ''),
+        ], $extra);
+        $tags = $e->tags ?? [];
+        if (is_array($tags) && $tags !== []) {
+            $data['cache.tags_count'] = count($tags);
+        }
+        if ($e instanceof KeyWritten && isset($e->seconds) && is_int($e->seconds) && $e->seconds > 0) {
+            $data['cache.ttl_seconds'] = $e->seconds;
+        }
+
+        return $data;
+    }
+
+    private static function truncateCacheKey(string $key): string
+    {
+        return strlen($key) > 200 ? substr($key, 0, 197).'…' : $key;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private static function redisSpanAttributes(CommandExecuted $e, float $timeMs): array
+    {
+        $cmd = strtoupper((string) $e->command);
+        $params = $e->parameters;
+        $hay = self::redisCommandSearchHaystack($cmd, $params);
+        $info = self::redisBlockingAndLockInfo($cmd, $params, $hay);
+
+        $data = [
+            'db.system' => 'redis',
+            'db.redis.connection' => $e->connectionName,
+            'db.duration_ms' => round($timeMs, 3),
+        ];
+
+        if ($info['blocking']) {
+            $data['redis.blocking'] = true;
+            if ($timeMs > 0) {
+                $data['redis.blocking_duration_ms'] = round($timeMs, 3);
+            }
+        }
+        if ($info['lock_related']) {
+            $data['cache.lock_attempt'] = true;
+            self::$cacheLockAttemptCount++;
+        }
+
+        return $data;
+    }
+
+    /**
+     * @param  array<int, mixed>  $parameters
+     */
+    private static function redisCommandSearchHaystack(string $command, array $parameters): string
+    {
+        $parts = [strtolower($command)];
+        foreach ($parameters as $p) {
+            if (is_string($p)) {
+                $parts[] = strtolower($p);
+            } elseif (is_scalar($p) || $p === null) {
+                $parts[] = strtolower((string) json_encode($p));
+            }
+        }
+
+        return implode(' ', $parts);
+    }
+
+    /**
+     * @param  array<int, mixed>  $parameters
+     * @return array{blocking: bool, lock_related: bool}
+     */
+    private static function redisBlockingAndLockInfo(string $command, array $parameters, string $hay): array
+    {
+        $cmd = strtolower($command);
+        $blocking = false;
+        $lockRelated = false;
+
+        static $nativeBlocking = [
+            'blpop', 'brpop', 'brpoplpush', 'blmove', 'bzpopmin', 'bzpopmax',
+        ];
+        foreach ($nativeBlocking as $prefix) {
+            if ($cmd === $prefix || str_starts_with($cmd, $prefix)) {
+                $blocking = true;
+                break;
+            }
+        }
+
+        if (($cmd === 'xread' || $cmd === 'xreadgroup') && preg_match('/\bblock\s+\d+/i', $hay)) {
+            $blocking = true;
+        }
+
+        if ($cmd === 'set') {
+            foreach ($parameters as $p) {
+                if (is_string($p) && strtoupper($p) === 'NX') {
+                    $lockRelated = true;
+                    break;
+                }
+            }
+        }
+
+        return ['blocking' => $blocking, 'lock_related' => $lockRelated];
+    }
+
+    private static function redisCommandDescription(CommandExecuted $e): string
+    {
+        $cmd = strtoupper((string) $e->command);
+        $parts = [$cmd];
+        foreach (array_slice($e->parameters, 0, 4) as $p) {
+            if (is_string($p)) {
+                $parts[] = self::truncateCacheKey($p);
+            } elseif (is_scalar($p) || $p === null) {
+                $parts[] = (string) json_encode($p);
+            } else {
+                $parts[] = '{…}';
+            }
+        }
+        $desc = implode(' ', $parts);
+
+        return strlen($desc) > 512 ? substr($desc, 0, 509).'…' : $desc;
+    }
+
+    private static function registerLaravelHttpClientPerformance(Dispatcher $events): void
+    {
+        if (! class_exists(RequestSending::class)) {
+            return;
+        }
+
+        $events->listen(RequestSending::class, [self::class, 'onHttpClientRequestSending']);
+        $events->listen(ResponseReceived::class, [self::class, 'onHttpClientResponseReceived']);
+        $events->listen(ConnectionFailed::class, [self::class, 'onHttpClientConnectionFailed']);
+    }
+
+    public static function onHttpClientRequestSending(RequestSending $event): void
+    {
+        if (! self::performanceEnabled() || ! self::collector('http_client')) {
+            return;
+        }
+        if (! Tracer::instance()->shouldRecordHttpClientSpans()) {
+            return;
+        }
+        $parent = Tracer::instance()->getCurrentSpan();
+        if ($parent === null || $parent->isFinished() || ! Tracer::instance()->isSpanRecordingEnabled()) {
+            return;
+        }
+
+        $req = $event->request;
+        if (! $req instanceof HttpClientRequest) {
+            return;
+        }
+
+        $uri = method_exists($req, 'url') ? (string) $req->url() : '';
+        $method = method_exists($req, 'method') ? (string) $req->method() : 'GET';
+        $desc = $method.' '.$uri;
+        if (strlen($desc) > 512) {
+            $desc = substr($desc, 0, 509).'…';
+        }
+        $span = $parent->startChild(SpanOperation::HTTP_CLIENT, $desc);
+        $host = parse_url($uri, PHP_URL_HOST);
+        if (is_string($host) && $host !== '') {
+            $span->setData(['server.address' => $host]);
+        }
+        self::httpClientSpanMap()->offsetSet($req, $span);
+    }
+
+    public static function onHttpClientResponseReceived(ResponseReceived $event): void
+    {
+        if (! self::performanceEnabled() || ! self::collector('http_client')) {
+            return;
+        }
+        $req = $event->request;
+        if (! $req instanceof HttpClientRequest) {
+            return;
+        }
+        $span = self::httpClientSpanMap()->offsetExists($req) ? self::httpClientSpanMap()->offsetGet($req) : null;
+        if ($span === null || $span->isFinished()) {
+            return;
+        }
+        self::httpClientSpanMap()->offsetUnset($req);
+        $res = $event->response;
+        $code = method_exists($res, 'status') ? (int) $res->status() : 0;
+        if ($code > 0) {
+            $span->setData(['http.status_code' => $code]);
+        }
+        if ($code >= 500) {
+            $span->setStatus('internal_error');
+        }
+        self::$httpClientCount++;
+        self::$httpClientDurationMs += max(0.0, (microtime(true) - $span->startUnix()) * 1000);
+        $span->finish();
+    }
+
+    public static function onHttpClientConnectionFailed(ConnectionFailed $event): void
+    {
+        if (! self::performanceEnabled() || ! self::collector('http_client')) {
+            return;
+        }
+        $req = $event->request;
+        if (! $req instanceof HttpClientRequest) {
+            return;
+        }
+        $span = self::httpClientSpanMap()->offsetExists($req) ? self::httpClientSpanMap()->offsetGet($req) : null;
+        if ($span === null || $span->isFinished()) {
+            return;
+        }
+        self::httpClientSpanMap()->offsetUnset($req);
+        $span->setStatus('internal_error');
+        $span->setData(['error' => $event->exception->getMessage()]);
+        self::$httpClientCount++;
+        self::$httpClientDurationMs += max(0.0, (microtime(true) - $span->startUnix()) * 1000);
+        $span->finish();
+    }
+
+    /**
+     * @return WeakMap<HttpClientRequest, Span>
+     */
+    private static function httpClientSpanMap(): WeakMap
+    {
+        return self::$httpClientSpans ??= new WeakMap;
+    }
+
+    public static function onRequestHandled(RequestHandled $event): void
+    {
+        if (! self::performanceEnabled()) {
+            return;
+        }
+        if (IngestSelfMonitoring::shouldSkipMonitoring($event->request)) {
+            return;
+        }
+
+        try {
+            self::attachTransactionInsights();
+            self::attachHttpRequestMetadata($event->request, $event->response);
+            AutoProfiler::finishAndSend();
+            Tracer::instance()->finishAutoHttpServerTransaction($event->response->getStatusCode());
+        } catch (Throwable) {
+            // Never break the host response lifecycle for monitoring hooks.
+        }
+    }
+
+    /**
+     * Attach request/response metadata to the root http.server span. PII-bearing fields
+     * (client IP, user id) are opt-in via config('bilge-tracing.performance.request_metadata').
+     */
+    private static function attachHttpRequestMetadata(Request $request, SymfonyResponse $response): void
+    {
+        $span = Tracer::instance()->getCurrentSpan();
+        if ($span === null || $span->isFinished() || $span->op !== SpanOperation::HTTP_SERVER) {
+            return;
+        }
+
+        $perf = config('bilge-tracing.performance');
+        $meta = is_array($perf) && is_array($perf['request_metadata'] ?? null) ? $perf['request_metadata'] : [];
+        $data = [];
+
+        $route = $request->route();
+        if ($route !== null && is_string($route->uri()) && $route->uri() !== '') {
+            $data['http.route'] = '/'.ltrim($route->uri(), '/');
+        }
+
+        if (($meta['query_string'] ?? true) && ($query = (string) $request->getQueryString()) !== '') {
+            $data['http.request.query'] = substr($query, 0, 512);
+        }
+
+        if ($meta['user_agent'] ?? true) {
+            $agent = (string) ($request->userAgent() ?? '');
+            if ($agent !== '') {
+                $data['http.user_agent'] = substr($agent, 0, 512);
+            }
+        }
+
+        if ($meta['client_ip'] ?? false) {
+            $ip = (string) ($request->ip() ?? '');
+            if ($ip !== '') {
+                $data['http.client_ip'] = $ip;
+            }
+        }
+
+        if ($meta['user_id'] ?? false) {
+            $userId = self::authenticatedUserId();
+            if ($userId !== null) {
+                $data['http.user_id'] = $userId;
+            }
+        }
+
+        if ($meta['user_name'] ?? false) {
+            $userName = self::authenticatedUserAttribute(['name', 'display_name', 'username', 'full_name']);
+            if ($userName !== null) {
+                $data['http.user_name'] = substr($userName, 0, 256);
+            }
+        }
+
+        if ($meta['user_email'] ?? false) {
+            $userEmail = self::authenticatedUserAttribute(['email', 'email_address']);
+            if ($userEmail !== null) {
+                $data['http.user_email'] = substr($userEmail, 0, 256);
+            }
+        }
+
+        if ($meta['response_size'] ?? true) {
+            $bytes = self::responseSize($response);
+            if ($bytes !== null) {
+                $data['http.response.body.size'] = $bytes;
+            }
+        }
+
+        if ($meta['http_method'] ?? true) {
+            $data['http.method'] = strtoupper($request->getMethod());
+        }
+
+        if ($meta['content_type'] ?? true) {
+            $requestType = (string) ($request->headers->get('Content-Type') ?? '');
+            if ($requestType !== '') {
+                $data['http.request.content_type'] = substr($requestType, 0, 128);
+            }
+            $responseType = (string) ($response->headers->get('Content-Type') ?? '');
+            if ($responseType !== '') {
+                $data['http.response.content_type'] = substr($responseType, 0, 128);
+            }
+        }
+
+        if (($meta['route_params'] ?? true) && $route instanceof Route) {
+            $params = self::routeParameters($route);
+            if ($params !== []) {
+                $data['http.route_params'] = $params;
+            }
+        }
+
+        if ($meta['request_headers'] ?? false) {
+            $headers = self::redactedHeaders($request->headers->all());
+            if ($headers !== []) {
+                $data['http.request.headers'] = $headers;
+            }
+        }
+
+        if ($meta['response_headers'] ?? false) {
+            $headers = self::redactedHeaders($response->headers->all());
+            if ($headers !== []) {
+                $data['http.response.headers'] = $headers;
+            }
+        }
+
+        $bodyMaxBytes = max(0, (int) ($meta['body_max_bytes'] ?? 8192));
+
+        if (($meta['request_body'] ?? false) && $bodyMaxBytes > 0) {
+            $body = self::requestBody($request, $bodyMaxBytes);
+            if ($body !== null) {
+                $data['http.request.body'] = $body;
+            }
+        }
+
+        if (($meta['response_body'] ?? false) && $bodyMaxBytes > 0) {
+            $body = self::responseBody($response, $bodyMaxBytes);
+            if ($body !== null) {
+                $data['http.response.body'] = $body;
+            }
+        }
+
+        if ($data !== []) {
+            $span->setData($data);
+        }
+    }
+
+    /**
+     * Route parameters with object (route-model-bound) values reduced to their route key,
+     * then redacted by key name. Never serializes a bound model.
+     *
+     * @return array<string, scalar>
+     */
+    private static function routeParameters(Route $route): array
+    {
+        try {
+            $params = $route->parameters();
+        } catch (Throwable) {
+            return [];
+        }
+
+        $out = [];
+        foreach ($params as $key => $value) {
+            if (is_scalar($value)) {
+                $out[(string) $key] = is_string($value) ? substr($value, 0, 256) : $value;
+            } elseif (is_object($value) && method_exists($value, 'getRouteKey')) {
+                $routeKey = $value->getRouteKey();
+                if (is_scalar($routeKey)) {
+                    $out[(string) $key] = is_string($routeKey) ? substr($routeKey, 0, 256) : $routeKey;
+                }
+            }
+        }
+
+        /** @var array<string, scalar> */
+        return DataRedactor::redact($out);
+    }
+
+    /**
+     * Flatten a Symfony header bag to a redacted, capped string map.
+     *
+     * @param  array<string, array<int, string|null>>  $headers
+     * @return array<string, string>
+     */
+    private static function redactedHeaders(array $headers): array
+    {
+        $flat = [];
+        foreach ($headers as $name => $values) {
+            if (count($flat) >= 64) {
+                break;
+            }
+            $list = is_array($values) ? $values : [$values];
+            $joined = implode(', ', array_map(static fn ($v): string => (string) $v, $list));
+            $flat[strtolower((string) $name)] = substr($joined, 0, 512);
+        }
+
+        /** @var array<string, string> */
+        return DataRedactor::redact($flat);
+    }
+
+    /**
+     * Capture the request body. Structured (JSON/form) payloads are redacted by key and
+     * returned as an array; otherwise the raw content is truncated to $maxBytes.
+     *
+     * @return array<string, mixed>|string|null
+     */
+    private static function requestBody(Request $request, int $maxBytes): array|string|null
+    {
+        try {
+            $params = $request->isJson() ? (array) $request->json()->all() : $request->request->all();
+        } catch (Throwable) {
+            $params = [];
+        }
+
+        if ($params !== []) {
+            $redacted = DataRedactor::redact($params);
+            $encoded = json_encode($redacted);
+            if (is_string($encoded) && strlen($encoded) > $maxBytes) {
+                return ['_truncated' => true, '_bytes' => strlen($encoded)];
+            }
+
+            return $redacted;
+        }
+
+        $raw = (string) $request->getContent();
+        if ($raw === '') {
+            return null;
+        }
+
+        return substr($raw, 0, $maxBytes);
+    }
+
+    /**
+     * Capture textual/JSON response bodies only. JSON is redacted by key; other text is
+     * truncated to $maxBytes. Binary, streamed, and file responses are skipped.
+     *
+     * @return array<string, mixed>|string|null
+     */
+    private static function responseBody(SymfonyResponse $response, int $maxBytes): array|string|null
+    {
+        $type = strtolower((string) ($response->headers->get('Content-Type') ?? ''));
+        $content = $response->getContent();
+        if (! is_string($content) || $content === '') {
+            return null;
+        }
+
+        if (str_contains($type, 'json')) {
+            $decoded = json_decode($content, true);
+            if (is_array($decoded)) {
+                $redacted = DataRedactor::redact($decoded);
+                $encoded = json_encode($redacted);
+                if (is_string($encoded)) {
+                    return strlen($encoded) > $maxBytes ? substr($encoded, 0, $maxBytes) : $redacted;
+                }
+            }
+        }
+
+        $isTextual = $type === '' || str_starts_with($type, 'text/') || str_contains($type, 'json') || str_contains($type, 'xml');
+        if (! $isTextual) {
+            return null;
+        }
+
+        return substr($content, 0, $maxBytes);
+    }
+
+    private static function authenticatedUserId(): ?string
+    {
+        try {
+            $id = auth()->id();
+        } catch (Throwable) {
+            return null;
+        }
+        if (is_int($id) || (is_string($id) && $id !== '')) {
+            return (string) $id;
+        }
+
+        return null;
+    }
+
+    /**
+     * Read the first non-empty string attribute from the authenticated user. Used for the
+     * opt-in user_name / user_email metadata so the monitoring UI can show who made a request.
+     *
+     * @param  list<string>  $attributes
+     */
+    private static function authenticatedUserAttribute(array $attributes): ?string
+    {
+        try {
+            $user = auth()->user();
+        } catch (Throwable) {
+            return null;
+        }
+        if (! is_object($user)) {
+            return null;
+        }
+
+        foreach ($attributes as $attribute) {
+            try {
+                $value = $user->{$attribute} ?? null;
+            } catch (Throwable) {
+                continue;
+            }
+            if (is_string($value) && trim($value) !== '') {
+                return trim($value);
+            }
+        }
+
+        return null;
+    }
+
+    private static function responseSize(SymfonyResponse $response): ?int
+    {
+        $header = $response->headers->get('Content-Length');
+        if (is_numeric($header)) {
+            return (int) $header;
+        }
+        $content = $response->getContent();
+        if (is_string($content) && $content !== '') {
+            return strlen($content);
+        }
+
+        return null;
+    }
+
+    public static function onCommandStarting(CommandStarting $event): void
+    {
+        if (! self::performanceEnabled() || ! self::collector('console')) {
+            return;
+        }
+        self::resetTransactionCounters();
+        MemoryPeakReset::beforeUnitOfWork();
+        Tracer::instance()->continueTrace(null, null);
+        $name = 'artisan '.$event->command;
+        Tracer::instance()->startAutoConsoleTransaction($name);
+        AutoProfiler::maybeStart();
+    }
+
+    public static function onCommandFinished(CommandFinished $event): void
+    {
+        if (! self::performanceEnabled() || ! self::collector('console')) {
+            return;
+        }
+        self::attachTransactionInsights();
+        $span = Tracer::instance()->getCurrentSpan();
+        if ($span !== null && ! $span->isFinished()) {
+            $span->setData(['exit_code' => $event->exitCode]);
+        }
+        AutoProfiler::finishAndSend();
+        Tracer::instance()->finishAutoConsoleTransaction();
+        self::maybeFlush();
+    }
+
+    public static function onJobProcessing(JobProcessing $event): void
+    {
+        if (! self::performanceEnabled() || ! self::collector('queue')) {
+            return;
+        }
+        self::resetTransactionCounters();
+        MemoryPeakReset::beforeUnitOfWork();
+
+        $tracer = Tracer::instance();
+        $tracer->suspendBeforeQueueJobDispatch();
+
+        $payload = self::jobPayload($event->job);
+        $propagated = self::extractBilgeQueueTrace($payload);
+        if ($propagated['trace_propagation'] !== null && $propagated['trace_propagation'] !== '') {
+            $tracer->continueTrace($propagated['trace_propagation'], $propagated['baggage'], true);
+        } else {
+            $tracer->continueTrace(null, null, true);
+        }
+
+        $name = self::resolveJobName($event->job);
+        $tracer->startAutoQueueTransaction($name);
+        AutoProfiler::maybeStart();
+        $span = $tracer->getCurrentSpan();
+        if ($span !== null) {
+            $maxTries = $payload['maxTries'] ?? null;
+            $uuid = $payload['uuid'] ?? null;
+            $queueName = '';
+            if ($event->job instanceof QueueJobContract && method_exists($event->job, 'getQueue')) {
+                $queueName = (string) $event->job->getQueue();
+            }
+            $attempt = 1;
+            if ($event->job instanceof QueueJobContract && method_exists($event->job, 'attempts')) {
+                $attempt = (int) $event->job->attempts();
+            }
+            $data = [
+                'queue.connection' => $event->connectionName,
+                'queue.name' => $queueName,
+                'queue.attempt' => $attempt,
+                'job.display_name' => substr($name, 0, 512),
+            ];
+            if ($maxTries !== null) {
+                $data['queue.max_tries'] = $maxTries;
+            }
+            if (is_string($uuid) && $uuid !== '') {
+                $data['job.uuid'] = $uuid;
+            }
+            $span->setData($data);
+        }
+    }
+
+    /**
+     * Finishes the {@code queue.process} transaction once per attempt (success, failure, or release for retry).
+     */
+    public static function onJobAttempted(JobAttempted $event): void
+    {
+        if (! self::performanceEnabled() || ! self::collector('queue')) {
+            return;
+        }
+        self::attachTransactionInsights();
+        $tracer = Tracer::instance();
+        $span = $tracer->getCurrentSpan();
+        if ($span !== null && ! $span->isFinished() && $span->op === SpanOperation::QUEUE_PROCESS) {
+            if (! $event->successful()) {
+                $span->setStatus('internal_error');
+                $ex = $event->exception;
+                if ($ex instanceof Throwable) {
+                    $msg = $ex->getMessage();
+                    if (strlen($msg) > 500) {
+                        $msg = substr($msg, 0, 497).'…';
+                    }
+                    $span->setData([
+                        'error' => $msg,
+                        'exception.class' => $ex::class,
+                    ]);
+                }
+            }
+            if ($event->job->hasFailed()) {
+                $span->setData(['queue.failed_permanently' => true]);
+            }
+        }
+        AutoProfiler::finishAndSend();
+        $tracer->finishAutoQueueTransaction();
+        $tracer->restoreAfterQueueJobAttempt();
+        self::maybeFlush();
+    }
+
+    /**
+     * Merged into every queue payload so workers can {@see Tracer::continueTrace()} under the dispatching request
+     * (and optional {@code queue.publish} producer span).
+     *
+     * @param  array<string, mixed>  $payload
+     * @return array<string, mixed>
+     */
+    public static function mergeQueuePayloadTraceContext(string $connection, ?string $queue, array $payload): array
+    {
+        if (! self::performanceEnabled() || ! self::collector('queue')) {
+            return [];
+        }
+        if (! filter_var(config('bilge-tracing.performance.queue_propagate_trace', true), FILTER_VALIDATE_BOOLEAN)) {
+            return [];
+        }
+
+        $tracer = Tracer::instance();
+        $parent = $tracer->getCurrentSpan();
+        if ($parent === null || $parent->isFinished()) {
+            return [];
+        }
+
+        $displayName = 'queue.job';
+        if (isset($payload['displayName']) && is_string($payload['displayName']) && $payload['displayName'] !== '') {
+            $displayName = $payload['displayName'];
+        } elseif (isset($payload['job']) && is_string($payload['job']) && $payload['job'] !== '') {
+            $displayName = $payload['job'];
+        }
+
+        $parsed = TracePropagationHeader::parse($tracer->traceparent());
+        if ($parsed === null) {
+            return [];
+        }
+
+        $recordPublish = filter_var(config('bilge-tracing.performance.queue_publish_span', true), FILTER_VALIDATE_BOOLEAN)
+            && $tracer->isSpanRecordingEnabled();
+
+        if ($recordPublish) {
+            $desc = strlen($displayName) > 512 ? substr($displayName, 0, 509).'…' : $displayName;
+            $pub = $parent->startChild(SpanOperation::QUEUE_PUBLISH, $desc);
+            $pubData = [
+                'queue.connection' => $connection,
+                'queue.name' => (string) ($queue ?? ''),
+                'job.display_name' => substr($displayName, 0, 512),
+            ];
+            if (isset($payload['uuid']) && is_string($payload['uuid']) && $payload['uuid'] !== '') {
+                $pubData['job.uuid'] = $payload['uuid'];
+            }
+            $pub->setData($pubData);
+            $pub->finish();
+            $tracePropagation = TracePropagationHeader::format($parsed['trace_id'], $pub->spanId, $parsed['sampled']);
+        } else {
+            $tracePropagation = $tracer->traceparent();
+        }
+
+        $alias = TraceWireHeaders::INGEST_TRACE_ALIAS;
+
+        return [
+            'bilge_tracing' => [
+                $alias => $tracePropagation,
+                'baggage' => $tracer->baggageHeader(),
+            ],
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $payload
+     * @return array{trace_propagation: ?string, baggage: ?string}
+     */
+    private static function extractBilgeQueueTrace(array $payload): array
+    {
+        $block = $payload['bilge_tracing'] ?? null;
+        if (! is_array($block)) {
+            return ['trace_propagation' => null, 'baggage' => null];
+        }
+        $alias = TraceWireHeaders::INGEST_TRACE_ALIAS;
+        $st = $block[$alias] ?? null;
+        $bg = $block['baggage'] ?? null;
+        $tracePropagation = is_string($st) && trim($st) !== '' ? trim($st) : null;
+        $baggage = is_string($bg) ? $bg : null;
+
+        return ['trace_propagation' => $tracePropagation, 'baggage' => $baggage];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private static function jobPayload(mixed $job): array
+    {
+        if (! is_object($job) || ! method_exists($job, 'payload')) {
+            return [];
+        }
+        try {
+            $p = $job->payload();
+
+            return is_array($p) ? $p : [];
+        } catch (Throwable) {
+            return [];
+        }
+    }
+
+    /**
+     * @internal
+     */
+    public static function resetCountersForTesting(): void
+    {
+        self::resetHttpRequestCounters();
+    }
+
+    /**
+     * @internal
+     */
+    public static function applyTransactionInsightsForTesting(): void
+    {
+        self::attachTransactionInsights();
+    }
+
+    /**
+     * @internal
+     */
+    public static function applyHttpRequestMetadataForTesting(Request $request, SymfonyResponse $response): void
+    {
+        self::attachHttpRequestMetadata($request, $response);
+    }
+
+    /**
+     * @internal
+     */
+    public static function recordHttpClientCallForTesting(float $durationMs): void
+    {
+        self::$httpClientCount++;
+        self::$httpClientDurationMs += max(0.0, $durationMs);
+    }
+
+    public static function onQueryExecuted(QueryExecuted $event): void
+    {
+        if (! self::performanceEnabled() || ! self::collector('database')) {
+            return;
+        }
+
+        self::$queryTotalCount++;
+        self::$queryTotalDurationMs += max(0.0, (float) $event->time);
+
+        $slowThresholdMs = self::slowQueryThresholdMs();
+        if ($slowThresholdMs > 0 && (float) $event->time >= $slowThresholdMs) {
+            self::$slowQueryCount++;
+        }
+
+        $fp = SqlFingerprint::normalize($event->sql);
+        if ($fp !== '') {
+            self::$sqlFingerprintCounts[$fp] = (self::$sqlFingerprintCounts[$fp] ?? 0) + 1;
+
+            if (self::queryInsightsEnabled()) {
+                $timeMs = (float) $event->time;
+                $truncatedSql = strlen($event->sql) > 2000 ? substr($event->sql, 0, 2000) : $event->sql;
+
+                // Capture frames only on the first sight of a fingerprint (bounded to 200 distinct
+                // statements) and for a new slowest query — never on every execution, since
+                // debug_backtrace is comparatively expensive in a hot query loop.
+                if (! isset(self::$sqlFingerprintSample[$fp]) && count(self::$sqlFingerprintSample) < 200) {
+                    self::$sqlFingerprintSample[$fp] = $truncatedSql;
+                    self::$sqlFingerprintFrames[$fp] = self::appBacktrace();
+                }
+
+                if ($timeMs >= self::$slowestQueryTimeMs) {
+                    self::$slowestQueryTimeMs = $timeMs;
+                    self::$slowestQuerySql = $truncatedSql;
+                    self::$slowestQueryFrames = self::appBacktrace();
+                }
+            }
+        }
+
+        $parent = Tracer::instance()->getCurrentSpan();
+        if ($parent === null || ! Tracer::instance()->isSpanRecordingEnabled()) {
+            return;
+        }
+
+        self::$querySeq++;
+        $sample = (int) (config('bilge-tracing.performance.database_sample_every') ?? 1);
+        $sample = max(1, $sample);
+        if ((self::$querySeq % $sample) !== 0) {
+            return;
+        }
+
+        $now = microtime(true);
+        $start = $now - ($event->time / 1000.0);
+        $sql = strlen($event->sql) > 2000 ? substr($event->sql, 0, 2000).'…' : $event->sql;
+        $child = $parent->startChild(SpanOperation::DB_QUERY, $sql, $start);
+        $spanData = [
+            'db.system' => $event->connectionName,
+            'db.duration_ms' => $event->time,
+            'db.bindings_count' => count($event->bindings),
+        ];
+        if ($fp !== '') {
+            $spanData['db.statement_fingerprint'] = $fp;
+        }
+        if ($event->readWriteType !== null) {
+            $spanData['db.read_write'] = $event->readWriteType;
+        }
+        if ($slowThresholdMs > 0 && (float) $event->time >= $slowThresholdMs) {
+            $spanData['db.slow'] = true;
+        }
+        $child->setData($spanData);
+        $child->finish($now);
+    }
+
+    private static function slowQueryThresholdMs(): float
+    {
+        $perf = config('bilge-tracing.performance');
+        if (! is_array($perf)) {
+            return 100.0;
+        }
+
+        return max(0.0, (float) ($perf['slow_query_ms'] ?? 100));
+    }
+
+    /**
+     * The fingerprint with the highest execution count this transaction — the statement most likely
+     * responsible for a suspected N+1. Returns null when no statements were recorded.
+     */
+    private static function mostRepeatedFingerprint(): ?string
+    {
+        if (self::$sqlFingerprintCounts === []) {
+            return null;
+        }
+
+        $offendingFp = null;
+        $max = -1;
+        foreach (self::$sqlFingerprintCounts as $fp => $count) {
+            if ($count > $max) {
+                $max = $count;
+                $offendingFp = (string) $fp;
+            }
+        }
+
+        return $offendingFp;
+    }
+
+    /**
+     * Whether the query_insights signal is on. Mirrors the gating used by attachTransactionInsights
+     * (defaults to enabled when unset) so N+1 / slow-query frame capture matches what gets emitted.
+     */
+    private static function queryInsightsEnabled(): bool
+    {
+        $perf = config('bilge-tracing.performance');
+        $insights = is_array($perf) ? ($perf['query_insights'] ?? []) : [];
+
+        return ! is_array($insights) || ($insights['enabled'] ?? true);
+    }
+
+    /**
+     * Capture the current call stack, innermost-first (the query call site first), in the Frame
+     * shape the server's stack renderer expects. Frames inside this SDK and frames without a file
+     * are dropped, and the result is capped at 30 frames. Arguments are never captured.
+     *
+     * @return list<array{function: string, call: string, class?: string, file: string, line: int}>
+     */
+    private static function appBacktrace(): array
+    {
+        $raw = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 60);
+
+        $frames = [];
+        foreach ($raw as $frame) {
+            $file = $frame['file'] ?? null;
+            if ($file === null) {
+                continue;
+            }
+
+            $class = $frame['class'] ?? null;
+            $function = (string) ($frame['function'] ?? '');
+
+            if (is_string($class) && str_starts_with($class, 'Bilge\\Tracing')) {
+                continue;
+            }
+
+            $type = $frame['type'] ?? '';
+            $call = is_string($class) && $class !== ''
+                ? $class.$type.$function
+                : $function;
+
+            $mapped = [
+                'function' => $function,
+                'call' => $call,
+                'file' => (string) $file,
+                'line' => (int) ($frame['line'] ?? 0),
+            ];
+            if (is_string($class) && $class !== '') {
+                $mapped['class'] = $class;
+            }
+
+            $frames[] = $mapped;
+
+            if (count($frames) >= 30) {
+                break;
+            }
+        }
+
+        return $frames;
+    }
+
+    public static function onMessageLogged(MessageLogged $event): void
+    {
+        if (! self::performanceEnabled() || ! self::collector('log')) {
+            return;
+        }
+        $span = Tracer::instance()->getCurrentSpan();
+        if ($span === null || $span->isFinished() || ! Tracer::instance()->isSpanRecordingEnabled()) {
+            return;
+        }
+        $msg = strlen($event->message) > 500 ? substr($event->message, 0, 500).'…' : $event->message;
+        $span->addSpanEvent('log', null, [
+            'log.level' => $event->level,
+            'log.message' => $msg,
+        ]);
+    }
+
+    private static function resetTransactionCounters(): void
+    {
+        self::resetHttpRequestCounters();
+    }
+
+    private static function attachTransactionInsights(): void
+    {
+        $perf = config('bilge-tracing.performance');
+        $insights = is_array($perf) ? ($perf['query_insights'] ?? []) : [];
+        $enabled = ! is_array($insights) || ($insights['enabled'] ?? true);
+
+        $span = Tracer::instance()->getCurrentSpan();
+        if ($span === null || $span->isFinished()) {
+            return;
+        }
+
+        $data = [];
+
+        if (self::collector('database')) {
+            $data['db.query_count'] = self::$queryTotalCount;
+            if (self::$queryTotalCount > 0) {
+                $data['db.total_duration_ms'] = round(self::$queryTotalDurationMs, 3);
+            }
+            if (self::$slowQueryCount > 0) {
+                $data['db.slow_query_count'] = self::$slowQueryCount;
+            }
+            $slowThresholdMs = self::slowQueryThresholdMs();
+            if ($slowThresholdMs > 0 && self::$slowestQuerySql !== '' && self::$slowestQueryTimeMs >= $slowThresholdMs) {
+                $data['db.slow_query'] = self::$slowestQuerySql;
+                $data['db.slow_query_time_ms'] = self::$slowestQueryTimeMs;
+                $data['db.slow_query_frames'] = self::$slowestQueryFrames;
+            }
+        }
+
+        if ($enabled && self::collector('database') && self::$queryTotalCount > 0) {
+            $counts = array_values(self::$sqlFingerprintCounts);
+            $maxRepeat = $counts !== [] ? max($counts) : 0;
+            $unique = count(self::$sqlFingerprintCounts);
+            $data['db.unique_statements'] = $unique;
+            $data['db.repeat_query_max'] = $maxRepeat;
+
+            $thresholdRepeat = (int) ($insights['n_plus_one_min_repeat'] ?? 4);
+            $thresholdRepeat = max(2, $thresholdRepeat);
+            $thresholdQueries = (int) ($insights['n_plus_one_min_queries'] ?? 8);
+            $thresholdQueries = max(4, $thresholdQueries);
+            if ($maxRepeat >= $thresholdRepeat && self::$queryTotalCount >= $thresholdQueries) {
+                $data['db.suspected_n_plus_one'] = true;
+
+                $offendingFp = self::mostRepeatedFingerprint();
+                if ($offendingFp !== null && isset(self::$sqlFingerprintSample[$offendingFp])) {
+                    $data['db.n_plus_one_query'] = self::$sqlFingerprintSample[$offendingFp];
+                    $data['db.n_plus_one_frames'] = self::$sqlFingerprintFrames[$offendingFp] ?? [];
+                }
+            }
+        }
+
+        if (self::collector('cache')) {
+            $cacheTouches = self::$cacheInsightHits + self::$cacheInsightMisses + self::$cacheInsightSets + self::$cacheInsightForgets;
+            if ($cacheTouches > 0 || self::$cacheManyGetBatches > 0 || self::$cacheManyPutBatches > 0) {
+                $data['cache.hit_count'] = self::$cacheInsightHits;
+                $data['cache.miss_count'] = self::$cacheInsightMisses;
+                $data['cache.set_count'] = self::$cacheInsightSets;
+                $data['cache.forget_count'] = self::$cacheInsightForgets;
+                if (self::$cacheManyGetBatches > 0) {
+                    $data['cache.batch.many_get'] = self::$cacheManyGetBatches;
+                }
+                if (self::$cacheManyPutBatches > 0) {
+                    $data['cache.batch.many_set'] = self::$cacheManyPutBatches;
+                }
+                $looked = self::$cacheInsightHits + self::$cacheInsightMisses;
+                if ($looked > 0) {
+                    $data['cache.hit_ratio'] = round(self::$cacheInsightHits / $looked, 4);
+                }
+            }
+            if (self::$cacheLockAttemptCount > 0) {
+                $data['cache.lock_attempt_count'] = self::$cacheLockAttemptCount;
+            }
+        }
+
+        if (self::collector('http_client') && self::$httpClientCount > 0) {
+            $data['http.client.count'] = self::$httpClientCount;
+            $data['http.client.time_ms'] = round(self::$httpClientDurationMs, 3);
+        }
+
+        if (self::collector('view') && (self::$viewSpanCount > 0 || self::$viewOverflowCount > 0)) {
+            $data['view.render_count'] = self::$viewSpanCount;
+            if (self::$viewOverflowCount > 0) {
+                $data['view.truncated_count'] = self::$viewOverflowCount;
+            }
+        }
+
+        if (in_array($span->op, [SpanOperation::HTTP_SERVER, SpanOperation::CONSOLE_COMMAND, SpanOperation::QUEUE_PROCESS], true)) {
+            $data['php.memory_peak_bytes'] = memory_get_peak_usage(true);
+            $data['php.memory_usage_bytes'] = memory_get_usage(true);
+        }
+
+        if ($data !== []) {
+            $span->setData($data);
+        }
+    }
+
+    private static function resolveJobName(mixed $job): string
+    {
+        if ($job instanceof QueueJobContract && method_exists($job, 'resolveName')) {
+            return (string) $job->resolveName();
+        }
+
+        return is_object($job) ? $job::class : 'queue.job';
+    }
+
+    /**
+     * Register a wildcard view composer that records one zero-duration {@code view.render}
+     * child span per composing view. Gated by the {@code view} performance collector
+     * (default off; auto-on under comprehensive_collection). Laravel emits no
+     * "view rendered" event, so these are point spans (start === end) carrying the view
+     * name (in description, for aggregation), relative path, and data-key names only.
+     */
+    public static function registerViewPerformance(Application $app): void
+    {
+        $perf = config('bilge-tracing.performance');
+        if (! is_array($perf) || empty($perf['enabled'])) {
+            return;
+        }
+        $collectors = is_array($perf['collectors'] ?? null) ? $perf['collectors'] : [];
+        if (empty($collectors['view'])) {
+            return;
+        }
+
+        $attach = static function (ViewFactory $factory): void {
+            // Must be a Closure: View@composer drops [class, method] callable arrays silently.
+            $factory->composer('*', static function (View $view): void {
+                self::onViewComposing($view);
+            });
+        };
+
+        if ($app->resolved('view')) {
+            $attach($app->make('view'));
+        }
+
+        $app->afterResolving('view', $attach);
+    }
+
+    public static function onViewComposing(View $view): void
+    {
+        if (! self::performanceEnabled() || ! self::collector('view')) {
+            return;
+        }
+        $parent = Tracer::instance()->getCurrentSpan();
+        if ($parent === null || $parent->isFinished() || ! Tracer::instance()->isSpanRecordingEnabled()) {
+            return;
+        }
+
+        $rawName = $view->name();
+
+        // Skip third-party/package namespaces (pagination::, mail::, <pkg>::) but keep
+        // Laravel's anonymous component namespace (__components::), which maps to first-party templates.
+        if (self::viewIsVendorNamespaced($rawName)) {
+            return;
+        }
+
+        $name = self::viewDisplayName($view, $rawName);
+
+        if (self::viewIsDeniedByConfig($name)) {
+            return;
+        }
+
+        if (self::$viewSpanCount >= self::viewMaxPerRequest()) {
+            self::$viewOverflowCount++;
+
+            return;
+        }
+
+        $index = self::$viewSpanCount;
+        self::$viewSpanCount++;
+
+        $data = [
+            'view.index' => $index,
+            'view.nested' => $index > 0,
+        ];
+        $path = self::viewRelativePath($view);
+        if ($path !== null) {
+            $data['view.path'] = $path;
+        }
+        $keys = self::viewDataKeys($view);
+        if ($keys !== []) {
+            $data['view.data_keys'] = $keys;
+        }
+        $tree = self::viewDataTree($view);
+        if ($tree !== null) {
+            $data['view.data'] = $tree;
+        }
+        $source = self::viewSource($view);
+        if ($source !== null) {
+            $data['view.source'] = $source['code'];
+            if ($source['truncated']) {
+                $data['view.source_truncated'] = true;
+            }
+        }
+
+        $now = microtime(true);
+        $child = $parent->startChild(SpanOperation::VIEW_RENDER, substr($name, 0, 512), $now);
+        $child->setData($data);
+        $child->finish($now);
+    }
+
+    private static function viewIsVendorNamespaced(string $name): bool
+    {
+        // Anonymous Blade components compile to the __components:: namespace; treat them as
+        // first-party (resolved to a readable name from their path). Any other "::" name is
+        // a registered package/vendor namespace and is skipped.
+        return str_contains($name, '::') && ! str_starts_with($name, '__components::');
+    }
+
+    private static function viewIsDeniedByConfig(string $name): bool
+    {
+        $perf = config('bilge-tracing.performance');
+        $patterns = is_array($perf) && is_array($perf['view_deny'] ?? null) ? $perf['view_deny'] : [];
+        foreach ($patterns as $pattern) {
+            if (is_string($pattern) && $pattern !== '' && str_contains($name, $pattern)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Human-readable view name. Anonymous components (__components::<hash>) and unnamed views
+     * resolve to a dotted path relative to the views directory (e.g. components.project.shell).
+     */
+    private static function viewDisplayName(View $view, string $rawName): string
+    {
+        if ($rawName !== '' && ! str_starts_with($rawName, '__components::')) {
+            return $rawName;
+        }
+
+        $derived = self::viewNameFromPath($view->getPath());
+        if ($derived !== null) {
+            return $derived;
+        }
+
+        return $rawName !== '' ? $rawName : 'view';
+    }
+
+    private static function viewNameFromPath(?string $path): ?string
+    {
+        if (! is_string($path) || $path === '') {
+            return null;
+        }
+
+        $rel = str_replace('\\', '/', $path);
+        $pos = strrpos($rel, '/views/');
+        if ($pos !== false) {
+            $rel = substr($rel, $pos + 7);
+        } else {
+            $base = str_replace('\\', '/', base_path());
+            if (str_starts_with($rel, $base)) {
+                $rel = ltrim(substr($rel, strlen($base)), '/');
+            }
+        }
+
+        $rel = (string) preg_replace('/\.blade\.php$|\.php$/', '', $rel);
+        $rel = trim(str_replace('/', '.', $rel), '.');
+
+        return $rel !== '' ? substr($rel, 0, 512) : null;
+    }
+
+    private static function viewMaxPerRequest(): int
+    {
+        $perf = config('bilge-tracing.performance');
+        $max = is_array($perf) ? (int) ($perf['view_max_per_request'] ?? 50) : 50;
+
+        return max(1, $max);
+    }
+
+    private static function viewRelativePath(View $view): ?string
+    {
+        $path = $view->getPath();
+        if (! is_string($path) || $path === '') {
+            return null;
+        }
+        $base = base_path();
+        if (str_starts_with($path, $base)) {
+            $path = ltrim(substr($path, strlen($base)), '/\\');
+        }
+
+        return substr($path, 0, 512);
+    }
+
+    /**
+     * @return list<string> view variable names only — never values (PII-safe)
+     */
+    private static function viewDataKeys(View $view): array
+    {
+        $data = $view->getData();
+        $keys = array_values(array_filter(array_keys($data), 'is_string'));
+        $keys = array_values(array_diff($keys, self::VIEW_INTERNAL_KEYS));
+        sort($keys);
+
+        return array_slice($keys, 0, 50);
+    }
+
+    /**
+     * Opt-in (performance.view_data) capture of the actual variable VALUES passed to the view,
+     * serialized into a normalized, redacted dump tree (caps + cycle detection + secret redaction
+     * by key). Returns null when disabled, when there is no data, or on any serialization failure.
+     *
+     * @return array<string, mixed>|null
+     */
+    private static function viewDataTree(View $view): ?array
+    {
+        if (! self::collectViewData()) {
+            return null;
+        }
+
+        $data = $view->getData();
+        $data = array_diff_key($data, array_flip(self::VIEW_INTERNAL_KEYS));
+        if ($data === []) {
+            return null;
+        }
+
+        try {
+            $result = (new DumpSerializer(self::viewDataSerializerOptions()))->serialize($data);
+        } catch (Throwable) {
+            return null;
+        }
+
+        $tree = $result['tree'] ?? null;
+
+        return is_array($tree) ? $tree : null;
+    }
+
+    private static function collectViewData(): bool
+    {
+        $perf = config('bilge-tracing.performance');
+
+        return is_array($perf) && filter_var($perf['view_data'] ?? false, FILTER_VALIDATE_BOOLEAN);
+    }
+
+    /**
+     * @return array{max_depth: int, max_children: int, max_string: int, max_total_bytes: int}
+     */
+    private static function viewDataSerializerOptions(): array
+    {
+        $perf = config('bilge-tracing.performance');
+        $opts = is_array($perf) && is_array($perf['view_data_serializer'] ?? null) ? $perf['view_data_serializer'] : [];
+
+        return [
+            'max_depth' => (int) ($opts['max_depth'] ?? 4),
+            'max_children' => (int) ($opts['max_children'] ?? 50),
+            'max_string' => (int) ($opts['max_string'] ?? 2048),
+            'max_total_bytes' => (int) ($opts['max_total_bytes'] ?? 16384),
+        ];
+    }
+
+    /**
+     * Opt-in (performance.view_source) capture of a capped excerpt of the template's own source so
+     * the UI can show what the view looks like. The same template renders many times per request, so
+     * the read is cached per absolute path. Returns null when disabled or the file is unreadable.
+     *
+     * @return array{code: string, truncated: bool}|null
+     */
+    private static function viewSource(View $view): ?array
+    {
+        if (! self::collectViewSource()) {
+            return null;
+        }
+
+        $path = $view->getPath();
+        if (! is_string($path) || $path === '') {
+            return null;
+        }
+        if (array_key_exists($path, self::$viewSourceCache)) {
+            return self::$viewSourceCache[$path];
+        }
+
+        $result = null;
+        if (is_file($path) && is_readable($path)) {
+            [$maxLines, $maxBytes] = self::viewSourceLimits();
+            $raw = @file_get_contents($path, false, null, 0, $maxBytes + 1);
+            if (is_string($raw) && $raw !== '') {
+                $truncated = strlen($raw) > $maxBytes;
+                if ($truncated) {
+                    $raw = substr($raw, 0, $maxBytes);
+                }
+                $lines = explode("\n", $raw);
+                if (count($lines) > $maxLines) {
+                    $lines = array_slice($lines, 0, $maxLines);
+                    $truncated = true;
+                }
+                $result = ['code' => implode("\n", $lines), 'truncated' => $truncated];
+            }
+        }
+
+        return self::$viewSourceCache[$path] = $result;
+    }
+
+    private static function collectViewSource(): bool
+    {
+        $perf = config('bilge-tracing.performance');
+
+        return is_array($perf) && filter_var($perf['view_source'] ?? false, FILTER_VALIDATE_BOOLEAN);
+    }
+
+    /**
+     * @return array{0: int, 1: int} [max_lines, max_bytes]
+     */
+    private static function viewSourceLimits(): array
+    {
+        $perf = config('bilge-tracing.performance');
+        $lines = is_array($perf) ? (int) ($perf['view_source_max_lines'] ?? 60) : 60;
+        $bytes = is_array($perf) ? (int) ($perf['view_source_max_bytes'] ?? 8192) : 8192;
+
+        return [max(1, $lines), max(256, $bytes)];
+    }
+
+    private static function performanceEnabled(): bool
+    {
+        return Tracer::instance()->isPerformanceEnabled();
+    }
+
+    private static function collector(string $key): bool
+    {
+        $perf = config('bilge-tracing.performance');
+        $c = is_array($perf['collectors'] ?? null) ? $perf['collectors'] : [];
+
+        return ! empty($c[$key]);
+    }
+
+    private static function maybeFlush(): void
+    {
+        if (config('bilge-tracing.performance.flush_after_cli_and_queue', false)) {
+            TraceIngestFlushReporter::flushWithReporting();
+        }
+    }
+}

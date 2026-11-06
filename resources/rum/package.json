@@ -1,0 +1,10 @@
+{
+    "$schema": "https://json.schemastore.org/package.json",
+    "name": "@bilge/rum",
+    "version": "0.1.0",
+    "description": "Bilge RUM: Web Vitals and SPA / Livewire navigation beacons (vanilla IIFE, no dependencies). Shipped inside bilge/tracing; mirrored as a standalone repo for JS consumers.",
+    "license": "MIT",
+    "private": false,
+    "main": "bilge-rum.js",
+    "files": ["bilge-rum.js", "package.json", "README.md"]
+}

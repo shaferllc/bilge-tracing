@@ -1,0 +1,345 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Bilge\Tracing\Metrics;
+
+use Bilge\Tracing\HttpTransport;
+use Bilge\Tracing\Tracer;
+
+/**
+ * Buffered custom metrics to {@code POST /api/ingest/metric}: {@code count}, {@code gauge},
+ * {@code distribution}, {@code start()}/{@code stop()} timers, fluent {@code metric()} builder, and {@code flush()}.
+ *
+ * Bilge stores each sample (with optional {@code trace_id} from the active tracer) so you can
+ * correlate spikes with traces and issues in the same project.
+ */
+final class MetricsIngestClient
+{
+    private static ?self $instance = null;
+
+    /** @var array<string, mixed> */
+    private static array $config = [];
+
+    /** @var list<array<string, mixed>> */
+    private array $buffer = [];
+
+    public static function instance(): self
+    {
+        return self::$instance ??= new self;
+    }
+
+    /**
+     * @param  array{
+     *     enabled?: bool,
+     *     api_key?: string|null,
+     *     base_uri?: string|null,
+     *     metric_ingest_path?: string|null,
+     *     environment?: string|null,
+     *     release?: string|null,
+     *     sample_rate?: float,
+     *     max_buffer?: int,
+     *     before_send_metric?: callable(array<string, mixed>): (array<string, mixed>|null)|null,
+     * }  $config
+     */
+    public static function configure(array $config): void
+    {
+        self::$config = array_merge(self::$config, $config);
+    }
+
+    public static function resetForTesting(): void
+    {
+        self::$config = [];
+        self::$instance = null;
+    }
+
+    public function isEnabled(): bool
+    {
+        return (bool) (self::$config['enabled'] ?? false);
+    }
+
+    /**
+     * @param  array<string, mixed>  $attributes
+     */
+    public function count(string $name, float $delta = 1.0, array $attributes = [], ?string $unit = null): void
+    {
+        $this->recordSample('counter', $name, $delta, [
+            'attributes' => $attributes,
+            'unit' => $unit,
+            'trace_id' => null,
+            'timestamp' => null,
+            'environment' => null,
+            'release' => null,
+        ]);
+    }
+
+    /**
+     * @param  array<string, mixed>  $attributes
+     */
+    public function gauge(string $name, float $value, array $attributes = [], ?string $unit = null): void
+    {
+        $this->recordSample('gauge', $name, $value, [
+            'attributes' => $attributes,
+            'unit' => $unit,
+            'trace_id' => null,
+            'timestamp' => null,
+            'environment' => null,
+            'release' => null,
+        ]);
+    }
+
+    /**
+     * @param  array<string, mixed>  $attributes
+     */
+    public function distribution(string $name, float $value, array $attributes = [], ?string $unit = null): void
+    {
+        $this->recordSample('distribution', $name, $value, [
+            'attributes' => $attributes,
+            'unit' => $unit,
+            'trace_id' => null,
+            'timestamp' => null,
+            'environment' => null,
+            'release' => null,
+        ]);
+    }
+
+    /**
+     * Fluent builder for one sample with attributes, unit, trace_id, timestamp, environment, and release.
+     */
+    public function metric(string $name): MetricBuilder
+    {
+        return new MetricBuilder($this, $name);
+    }
+
+    /**
+     * Start a wall-clock timer. Call {@see MetricTimer::stop()} to record duration as a distribution.
+     *
+     * @param  array<string, mixed>  $attributes
+     */
+    public function start(string $name, array $attributes = [], ?string $unit = null): MetricTimer
+    {
+        $builder = $this->metric($name)->attributes($attributes);
+        if ($unit !== null) {
+            $builder->unit($unit);
+        }
+
+        return $builder->start();
+    }
+
+    /**
+     * Run a callback and record its wall-clock duration as a distribution sample.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @param  array<string, mixed>  $attributes
+     * @return T
+     */
+    public function time(string $name, callable $callback, array $attributes = [], ?string $unit = null): mixed
+    {
+        $timer = $this->start($name, $attributes, $unit);
+        try {
+            return $callback();
+        } finally {
+            if (! $timer->isFinished()) {
+                $timer->stop();
+            }
+        }
+    }
+
+    /**
+     * @param  array{
+     *     attributes?: array<string, mixed>,
+     *     unit?: ?string,
+     *     trace_id?: ?string,
+     *     timestamp?: int|float|string|null,
+     *     environment?: ?string,
+     *     release?: ?string,
+     * }  $context
+     */
+    public function recordSample(string $kind, string $name, float $value, array $context = []): void
+    {
+        if (! $this->isEnabled()) {
+            return;
+        }
+        if (! is_finite($value)) {
+            return;
+        }
+        if (! $this->passesSampling()) {
+            return;
+        }
+
+        $attributes = $context['attributes'] ?? [];
+        if (! is_array($attributes)) {
+            $attributes = [];
+        }
+
+        $row = [
+            'name' => $name,
+            'kind' => $kind,
+            'value' => $value,
+        ];
+
+        $unit = $context['unit'] ?? null;
+        if (is_string($unit) && $unit !== '') {
+            $row['unit'] = $unit;
+        }
+        if ($attributes !== []) {
+            $row['attributes'] = $attributes;
+        }
+
+        foreach (['trace_id', 'environment', 'release'] as $key) {
+            $v = $context[$key] ?? null;
+            if (is_string($v) && $v !== '') {
+                $row[$key] = $v;
+            }
+        }
+
+        $timestamp = $context['timestamp'] ?? null;
+        if ($timestamp !== null && $timestamp !== '') {
+            $row['timestamp'] = $timestamp;
+        }
+
+        $filtered = $this->applyBeforeSend($this->applyDefaults($row));
+        if ($filtered === null) {
+            return;
+        }
+        $this->buffer[] = $filtered;
+        $this->maybeAutoFlush();
+    }
+
+    /**
+     * @param  array<string, mixed>  $row  Normalized ingest row ({@code name}, {@code kind}, {@code value} required).
+     */
+    public function enqueueEntry(array $row): void
+    {
+        if (! $this->isEnabled()) {
+            return;
+        }
+        if (! isset($row['name'], $row['kind'], $row['value']) || ! is_string($row['name']) || ! is_string($row['kind']) || ! is_numeric($row['value'])) {
+            return;
+        }
+        $v = (float) $row['value'];
+        if (! is_finite($v)) {
+            return;
+        }
+        if (! $this->passesSampling()) {
+            return;
+        }
+        $filtered = $this->applyBeforeSend($this->applyDefaults($row));
+        if ($filtered === null) {
+            return;
+        }
+        $this->buffer[] = $filtered;
+        $this->maybeAutoFlush();
+    }
+
+    /**
+     * POST buffered metric rows (chunks of up to 100). Clears the buffer after the attempt.
+     */
+    public function flush(): bool
+    {
+        if ($this->buffer === []) {
+            return true;
+        }
+        $key = (string) (self::$config['api_key'] ?? '');
+        $url = $this->ingestUrl();
+        if ($key === '' || $url === '') {
+            $this->buffer = [];
+
+            return false;
+        }
+        $maxChunk = 100;
+        $ok = true;
+        $chunks = array_chunk($this->buffer, $maxChunk);
+        $this->buffer = [];
+        foreach ($chunks as $chunk) {
+            $res = HttpTransport::postJsonWithResponse($url, $key, ['entries' => $chunk], clientSampled: true);
+            $status = $res['status'] ?? 0;
+            if ($status !== 202) {
+                $ok = false;
+            }
+        }
+
+        return $ok;
+    }
+
+    /**
+     * @param  array<string, mixed>  $row
+     * @return array<string, mixed>
+     */
+    private function applyDefaults(array $row): array
+    {
+        $env = self::$config['environment'] ?? null;
+        if (is_string($env) && $env !== '' && ! isset($row['environment'])) {
+            $row['environment'] = $env;
+        }
+        $rel = self::$config['release'] ?? null;
+        if (is_string($rel) && $rel !== '' && ! isset($row['release'])) {
+            $row['release'] = $rel;
+        }
+        if (! isset($row['trace_id'])) {
+            $tid = Tracer::instance()->traceId();
+            if ($tid !== '') {
+                $row['trace_id'] = $tid;
+            }
+        }
+
+        return $row;
+    }
+
+    /**
+     * @param  array<string, mixed>  $row
+     * @return array<string, mixed>|null
+     */
+    private function applyBeforeSend(array $row): ?array
+    {
+        $cb = self::$config['before_send_metric'] ?? null;
+        if (! is_callable($cb)) {
+            return $row;
+        }
+        $out = $cb($row);
+
+        return is_array($out) ? $out : null;
+    }
+
+    /**
+     * Random per-sample client-side sampling. Rate 1.0 keeps everything, 0.0 keeps nothing.
+     */
+    private function passesSampling(): bool
+    {
+        $rate = (float) (self::$config['sample_rate'] ?? 1.0);
+        $rate = max(0.0, min(1.0, $rate));
+
+        if ($rate >= 1.0) {
+            return true;
+        }
+        if ($rate <= 0.0) {
+            return false;
+        }
+
+        return (mt_rand() / mt_getrandmax()) < $rate;
+    }
+
+    private function maybeAutoFlush(): void
+    {
+        $max = (int) (self::$config['max_buffer'] ?? 500);
+        $max = max(50, min(1000, $max));
+        if (count($this->buffer) >= $max) {
+            $this->flush();
+        }
+    }
+
+    private function ingestUrl(): string
+    {
+        $base = isset(self::$config['base_uri']) && is_string(self::$config['base_uri'])
+            ? rtrim(self::$config['base_uri'], '/') : '';
+        $path = (string) (self::$config['metric_ingest_path'] ?? '/api/ingest/metric');
+        $path = '/'.ltrim($path, '/');
+        if ($base === '') {
+            return '';
+        }
+
+        return $base.$path;
+    }
+}

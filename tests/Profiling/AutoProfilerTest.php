@@ -1,0 +1,149 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Bilge\Tracing\Tests\Profiling;
+
+use Bilge\Tracing\Profiling\AutoProfiler;
+use Bilge\Tracing\Profiling\ProfileClient;
+use Bilge\Tracing\Profiling\ProfileIngestClient;
+use Bilge\Tracing\Tracer;
+use PHPUnit\Framework\TestCase;
+
+final class AutoProfilerTest extends TestCase
+{
+    /** Compact "{trace_id}-{span_id}-{sampled}" header; trailing 1/0 sets the sampled bit. */
+    private const SAMPLED_TRACEPARENT = '0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-1';
+
+    private const UNSAMPLED_TRACEPARENT = '0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-0';
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        AutoProfiler::resetForTesting();
+        ProfileClient::resetForTesting();
+        ProfileIngestClient::resetForTesting();
+        ProfileIngestClient::configure(['manual_pulse_fallback' => false]);
+        Tracer::resetForTesting();
+    }
+
+    protected function tearDown(): void
+    {
+        AutoProfiler::resetForTesting();
+        ProfileClient::resetForTesting();
+        ProfileIngestClient::resetForTesting();
+        Tracer::resetForTesting();
+        parent::tearDown();
+    }
+
+    public function test_is_noop_without_excimer(): void
+    {
+        AutoProfiler::configure(['enabled' => true, 'sample_rate' => 1.0]);
+        AutoProfiler::forceSampleFractionForTesting(0.0); // would always sample
+
+        AutoProfiler::maybeStart();
+
+        $this->assertFalse(AutoProfiler::isRunning(), 'must not start without the Excimer extension');
+        $this->assertFalse(AutoProfiler::finishAndSend(), 'nothing to send when no capture is running');
+    }
+
+    public function test_does_not_start_when_disabled(): void
+    {
+        AutoProfiler::configure(['enabled' => false, 'sample_rate' => 1.0]);
+        AutoProfiler::forceSampleFractionForTesting(0.0);
+
+        AutoProfiler::maybeStart();
+
+        $this->assertFalse(AutoProfiler::isRunning());
+    }
+
+    public function test_sample_rate_threshold_excludes_high_draw(): void
+    {
+        AutoProfiler::configure(['enabled' => true, 'sample_rate' => 0.25, 'follow_trace_sampling' => false]);
+        AutoProfiler::forceSampleFractionForTesting(0.5); // 0.5 >= 0.25 -> not sampled
+
+        $this->assertFalse(AutoProfiler::shouldProfileCurrentTransaction());
+
+        AutoProfiler::maybeStart();
+
+        $this->assertFalse(AutoProfiler::isRunning());
+    }
+
+    public function test_follows_trace_sampling_profiles_recorded_traces(): void
+    {
+        AutoProfiler::configure(['enabled' => true, 'follow_trace_sampling' => true, 'sample_rate' => 0.0]);
+
+        Tracer::instance()->continueTrace(self::SAMPLED_TRACEPARENT, null);
+        $this->assertTrue(
+            AutoProfiler::shouldProfileCurrentTransaction(),
+            'a recorded (sampled) trace should be profiled even with sample_rate 0'
+        );
+
+        Tracer::instance()->continueTrace(self::UNSAMPLED_TRACEPARENT, null);
+        $this->assertFalse(
+            AutoProfiler::shouldProfileCurrentTransaction(),
+            'an unsampled trace must not be profiled'
+        );
+    }
+
+    public function test_does_not_profile_when_disabled_even_if_trace_recorded(): void
+    {
+        AutoProfiler::configure(['enabled' => false, 'follow_trace_sampling' => true]);
+        Tracer::instance()->continueTrace(self::SAMPLED_TRACEPARENT, null);
+
+        $this->assertFalse(AutoProfiler::shouldProfileCurrentTransaction());
+    }
+
+    public function test_build_payload_merges_context_and_config_defaults(): void
+    {
+        AutoProfiler::configure(['environment' => 'production', 'release' => '1.2.3']);
+
+        $payload = AutoProfiler::buildPayload($this->fakeLog(), [
+            'trace_id' => 'abc123',
+            'transaction' => 'GET /x',
+        ]);
+
+        $this->assertSame('excimer', $payload['agent']);
+        $this->assertSame('speedscope', $payload['format']);
+        $this->assertIsArray($payload['data']);
+        $this->assertSame('abc123', $payload['trace_id']);
+        $this->assertSame('GET /x', $payload['transaction']);
+        $this->assertSame('production', $payload['environment']);
+        $this->assertSame('1.2.3', $payload['release']);
+    }
+
+    public function test_caller_context_overrides_config_defaults(): void
+    {
+        AutoProfiler::configure(['environment' => 'production', 'release' => '1.0.0']);
+
+        $payload = AutoProfiler::buildPayload($this->fakeLog(), ['environment' => 'staging']);
+
+        $this->assertSame('staging', $payload['environment']);
+        $this->assertSame('1.0.0', $payload['release']);
+    }
+
+    public function test_build_and_send_returns_false_and_never_throws_when_unconfigured(): void
+    {
+        // ProfileClient has no base_uri/api_key -> sendProfile() returns false without any network call.
+        $this->assertFalse(AutoProfiler::buildAndSend($this->fakeLog(), ['trace_id' => 'x']));
+    }
+
+    /**
+     * Excimer-shaped log: only getSpeedscopeData() is required by ExcimerExporter.
+     */
+    private function fakeLog(): object
+    {
+        return new class
+        {
+            /** @return array<string, mixed> */
+            public function getSpeedscopeData(): array
+            {
+                return [
+                    '$schema' => 'https://www.speedscope.app/file-format-schema.json',
+                    'profiles' => [],
+                    'shared' => ['frames' => []],
+                ];
+            }
+        };
+    }
+}
