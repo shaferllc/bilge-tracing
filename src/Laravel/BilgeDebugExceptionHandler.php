@@ -4,13 +4,16 @@ declare(strict_types=1);
 
 namespace Bilge\Tracing\Laravel;
 
+use Bilge\Tracing\Debug\RequestDetailsCollector;
+use Bilge\Tracing\Debug\RouteSuggestions;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Auth\AuthenticationException;
 use Illuminate\Contracts\Debug\ExceptionHandler;
+use Illuminate\Database\RecordsNotFoundException;
 use Illuminate\Http\Request;
+use Illuminate\Session\TokenMismatchException;
 use Illuminate\Validation\ValidationException;
-use Bilge\Tracing\Debug\RequestDetailsCollector;
-use Bilge\Tracing\Debug\RouteSuggestions;
+use Symfony\Component\HttpFoundation\Exception\SuspiciousOperationException;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
 use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
@@ -141,13 +144,17 @@ final class BilgeDebugExceptionHandler implements ExceptionHandler
 
     /**
      * Only "something actually broke" (would-be-500s). 4xx HttpExceptions,
-     * validation (422), auth (401/redirect), and authorization pass through.
+     * validation (422), auth (401/redirect), authorization, missing models (404),
+     * CSRF mismatches (419) and suspicious requests (400) pass through.
      */
     private function isServerError(Throwable $e): bool
     {
         if ($e instanceof ValidationException
             || $e instanceof AuthenticationException
-            || $e instanceof AuthorizationException) {
+            || $e instanceof AuthorizationException
+            || $e instanceof RecordsNotFoundException
+            || $e instanceof TokenMismatchException
+            || $e instanceof SuspiciousOperationException) {
             return false;
         }
         if ($e instanceof HttpExceptionInterface) {
