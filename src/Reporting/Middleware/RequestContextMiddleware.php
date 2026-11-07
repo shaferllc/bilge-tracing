@@ -89,6 +89,15 @@ final class RequestContextMiddleware implements ReportMiddlewareInterface
         }
         if ($server !== []) {
             $ctx['server'] = $server;
+        }
+
+        // End-user agent (not PII-sensitive) lets Bilge's inbound filters drop crawler noise server-side.
+        $ua = $req->userAgent();
+        if (is_string($ua) && $ua !== '' && ! isset($ctx['runtime']['user_agent'])) {
+            $ctx['runtime'] = array_merge(is_array($ctx['runtime'] ?? null) ? $ctx['runtime'] : [], ['user_agent' => substr($ua, 0, 1024)]);
+        }
+
+        if ($ctx !== []) {
             $payload['context'] = $ctx;
         }
 
