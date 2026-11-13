@@ -680,7 +680,7 @@ final class Tracer
     {
         $parent = $this->getCurrentSpan();
         if ($parent === null) {
-            throw new \RuntimeException('bilge/tracing: trace() requires an active transaction or span.');
+            throw new \RuntimeException('bilgesh/tracing: trace() requires an active transaction or span.');
         }
         $span = $parent->startChild($op, $description);
         try {

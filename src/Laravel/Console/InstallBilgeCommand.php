@@ -4,13 +4,13 @@ declare(strict_types=1);
 
 namespace Bilge\Tracing\Laravel\Console;
 
+use Bilge\Tracing\Laravel\Install\BilgeProvisionClient;
+use Bilge\Tracing\Support\BilgeDsn;
+use Bilge\Tracing\Support\MonitoringEnv;
 use Illuminate\Console\Command;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Str;
-use Bilge\Tracing\Laravel\Install\BilgeProvisionClient;
-use Bilge\Tracing\Support\BilgeDsn;
-use Bilge\Tracing\Support\MonitoringEnv;
 use Throwable;
 
 use function Laravel\Prompts\password;
@@ -329,7 +329,7 @@ final class InstallBilgeCommand extends Command
         $escaped = str_replace(['\\', '"', "\n", "\r"], ['\\\\', '\\"', '\n', '\r'], $dsn);
         $lines = [
             '',
-            '# Bilge (bilge/tracing package)',
+            '# Bilge (bilgesh/tracing package)',
             'BILGE_DSN="'.$escaped.'"',
         ];
         if ($includeLaravelQuick) {

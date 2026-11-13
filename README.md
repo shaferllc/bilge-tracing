@@ -1,4 +1,4 @@
-# bilge/tracing
+# bilgesh/tracing
 
 PHP library for **Bilge** distributed tracing: compact **traceparent**-style propagation, **W3C baggage**, manual transactions/spans, and optional Laravel integration. Wire formats stay compatible with common PHP tracing clients without naming third-party vendors here.
 
@@ -15,9 +15,9 @@ Run these from your **Laravel project root** (the directory that contains `artis
 1. **Add the package**
    ```bash
    cd /path/to/your-laravel-app
-   composer require bilge/tracing
+   composer require bilgesh/tracing
    ```
-   Composer updates `composer.json` / `composer.lock` and downloads `bilge/tracing` into `vendor/`.
+   Composer updates `composer.json` / `composer.lock` and downloads `bilgesh/tracing` into `vendor/`.
 
 2. **Configure Bilge (pick one path)**
    - **Interactive (recommended):** `php artisan bilge:install` — choose **Create a new project** (Bilge web URL + your **API token** from Profile → **API tokens**) or **Use an existing DSN**. Create flow calls Bilge’s API (`GET /api/v1/me`, `POST /api/v1/projects`), then writes **`BILGE_DSN`** using the new project’s ingest key. It also appends `BILGE_LARAVEL=true` to `.env`.
@@ -43,7 +43,7 @@ There is **no** Laravel service provider. Install the same Composer package and 
 
 ```bash
 cd /path/to/your-php-project
-composer require bilge/tracing
+composer require bilgesh/tracing
 ```
 
 Then wire **Bilge ingest** explicitly, for example:
@@ -60,7 +60,7 @@ Tracer::instance()->configure([
 
 Use **`Tracer`**, **`Tracing`**, **`bilge_logger()`**, **`bilge_metrics()`**, PSR-15 middleware (e.g. `ContinueTracePsr15Middleware`), and **`GuzzleTraceMiddleware`** as needed; see **Propagation**, **Custom instrumentation**, **Bilge ingest**, and **Guzzle 7** below. For Slim / Mezzio, see the `slim/slim` suggestion in `composer.json`.
 
-(This monorepo keeps the package source at `packages/bilge-tracing`. The Bilge app installs the published `bilge/tracing` package from Packagist so container deploys do not depend on a local path repository.)
+(This monorepo keeps the package source at `packages/bilge-tracing`. The Bilge app installs the published `bilgesh/tracing` package from Packagist so container deploys do not depend on a local path repository.)
 
 ## Propagation
 
@@ -319,7 +319,7 @@ Auto-discovery registers `Bilge\Tracing\Laravel\BilgeTracingServiceProvider`.
 ### Quick install
 
 ```bash
-composer require bilge/tracing
+composer require bilgesh/tracing
 php artisan bilge:install
 ```
 
